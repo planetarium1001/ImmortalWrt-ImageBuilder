@@ -4,9 +4,10 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 fail=0; pending=0
-for t in repo-shape workflows-shape readme-shape upstream-readme \
+for t in repo-shape workflows-shape readme-shape readme-flow upstream-readme \
          ext4-image-config check-packages portmap uci-defaults-idempotent \
-         minieap-config wandetect-vote campus-guard-toggle nikki-feed check-static \
+         minieap-config wandetect-vote ruijie-guard-toggle nikki-feed check-static \
+         no-site-words rename-consistency rootfs-grow docs-generic \
          nat66-native no-auto-disk docs-complete; do
 	sh "$ROOT/shell/tests/$t.sh" >/tmp/t.out 2>&1
 	rc=$?

@@ -14,7 +14,7 @@ scp root@192.168.100.1:/tmp/cfg-*.tar.gz .
 
 ```sh
 cp -a /etc/config/network /etc/config/network.bak
-uci revert network wanprofile campus-guard wandetect swap
+uci revert network wanprofile ruijie-guard wandetect swap
 ```
 
 ## 1. 站点 profile 切换（`wanmode`）
@@ -23,43 +23,43 @@ uci revert network wanprofile campus-guard wandetect swap
 
 | profile | 出厂协议 | 用途 |
 |---|---|---|
-| `campus` | `minieap` | 校园网锐捷认证 |
+| `ruijie` | `minieap` | 锐捷认证 |
 | `home` | `dhcp` | 家里光猫已拨号 / 上级路由给地址 |
 | `adhoc` | `dhcp` | 酒店、临时环境 |
 
 ```sh
 wanmode list                 # 列出可用 profile
-wanmode show                 # active=campus proto=minieap user=20230001
+wanmode show                 # active=ruijie proto=minieap user=20230001
 wanmode apply home           # 切家用
-wanmode apply campus         # 切回校园
+wanmode apply ruijie         # 切回认证网络
 ```
 
 改字段（`set <name> <key> <value>`，值含空格要加引号）：
 
 ```sh
-wanmode set campus username '20230001'
-wanmode set campus password 'p@ss w0rd'
-wanmode set campus dhcp_type '2'
+wanmode set ruijie username '20230001'
+wanmode set ruijie password 'p@ss w0rd'
+wanmode set ruijie dhcp_type '2'
 wanmode set home proto 'pppoe'          # 想在家 PPPoE 拨号时
 wanmode set home username '宽带账号'
 wanmode set home password '宽带密码'
 ```
 
-`wanmode apply` 实际做的事：写 `network.wan.proto`（及 `username`/`password`/`module`/`dhcp_type`/`auto=1`）→ `uci commit` → `ubus call network reload` → 打印 `applied <name> (<proto>)`。切到 `dhcp`/`pppoe` 时会先删掉 `wan.username`/`wan.password`，不会把校园网账号带过去。
+`wanmode apply` 实际做的事：写 `network.wan.proto`（及 `username`/`password`/`module`/`dhcp_type`/`auto=1`）→ `uci commit` → `ubus call network reload` → 打印 `applied <name> (<proto>)`。切到 `dhcp`/`pppoe` 时会先删掉 `wan.username`/`wan.password`，不会把认证账号带过去。
 
 验证与回滚：
 
 ```sh
 ifstatus wan | grep -E '"up"|"proto"|address'
 wanmode show
-wanmode apply campus             # 出问题切回来（LAN 没动，切 profile 不会失联）
+wanmode apply ruijie             # 出问题切回来（LAN 没动，切 profile 不会失联）
 ```
 
-## 2. 防检测开关（`campus-guard`）
+## 2. 防检测开关（`ruijie-guard`）
 
 ### 它就是一段防火墙规则
 
-`/usr/sbin/campus-guard` 只做一件事：把带标记的 nft 规则写进 `/etc/firewall.user`（LuCI「网络 → 防火墙 → 自定义规则」可见可改），然后 reload 防火墙。
+`/usr/sbin/ruijie-guard` 只做一件事：把带标记的 nft 规则写进 `/etc/firewall.user`（LuCI「网络 → 防火墙 → 自定义规则」可见可改），然后 reload 防火墙。
 
 | UCI 参数 | 作用 | 说明 |
 |---|---|---|
@@ -73,44 +73,44 @@ wanmode apply campus             # 出问题切回来（LAN 没动，切 profile
 ### 开 / 关 / 查看
 
 ```sh
-campus-guard show                    # 只打印将写入的规则，不改任何文件（先看再动）
-campus-guard status                  # enabled=... + 规则段是否存在
+ruijie-guard show                    # 只打印将写入的规则，不改任何文件（先看再动）
+ruijie-guard status                  # enabled=... + 规则段是否存在
 
 # 开启
-uci set campus-guard.globals.enabled='1'
-uci commit campus-guard
-campus-guard apply                   # 写规则段 + reload 防火墙
+uci set ruijie-guard.globals.enabled='1'
+uci commit ruijie-guard
+ruijie-guard apply                   # 写规则段 + reload 防火墙
 
 # 关闭（完整回滚）
-uci set campus-guard.globals.enabled='0'
-uci commit campus-guard
-campus-guard clear                   # 删规则段 + reload
+uci set ruijie-guard.globals.enabled='0'
+uci commit ruijie-guard
+ruijie-guard clear                   # 删规则段 + reload
 ```
 
 `apply` 先删旧段再写新段，反复执行不会叠加；`clear` 只删标记段，不动你在 `/etc/firewall.user` 里自己写的规则。
 
 ```sh
-sed -n '/^# BEGIN campus-guard/,/^# END campus-guard/p' /etc/firewall.user
+sed -n '/^# BEGIN ruijie-guard/,/^# END ruijie-guard/p' /etc/firewall.user
 ```
 
 生效验证：
 
 ```sh
-campus-guard status
+ruijie-guard status
 nft list chain inet fw4 mangle_forward 2>/dev/null | grep ttl
 nft list chain inet fw4 forward 2>/dev/null | grep -E '1900|5353|68'
 ```
 
 ### 后果与风险（务必读完）
 
-- **TTL 钳制**改掉所有经 WAN 外发的 IPv4 报文 TTL：`traceroute`/`mtr` 结果失真，个别按 TTL 判路径的服务异常。排查网络问题时先 `campus-guard clear`。
+- **TTL 钳制**改掉所有经 WAN 外发的 IPv4 报文 TTL：`traceroute`/`mtr` 结果失真，个别按 TTL 判路径的服务异常。排查网络问题时先 `ruijie-guard clear`。
 - **`block_leak` 只作用在转发链（forward）**，路由器自己发的 DHCP 不受影响；但 LAN 侧 DHCP 中继、跨 WAN 的 mDNS/DLNA 会被这条打断。
-- 规则里的出口网卡名写死为 **`eth0`**。若 `portmap resolve` 显示 WAN 不是 `eth0`，规则不命中——要么把 WAN 挪回 `eth0`，要么改 `/etc/firewall.user` 里的接口名（同时改 `/usr/sbin/campus-guard`，否则下次 `apply` 会覆盖）。
-- **合规风险**：这些能力可能违反校园网使用协议，先读 [compliance.md](compliance.md)。学校明确禁止共享接入时不要开。
+- 规则里的出口网卡名写死为 **`eth0`**。若 `portmap resolve` 显示 WAN 不是 `eth0`，规则不命中——要么把 WAN 挪回 `eth0`，要么改 `/etc/firewall.user` 里的接口名（同时改 `/usr/sbin/ruijie-guard`，否则下次 `apply` 会覆盖）。
+- **合规风险**：这些能力可能违反网络使用协议，先读 [compliance.md](compliance.md)。网络提供方明确禁止共享接入时不要开。
 
 ## 3. swap（`swapctl`）
 
-`/etc/config/swap` 描述一个 **swapfile**（不是 swap 分区），默认 4G，放在傲腾根分区：
+`/etc/config/swap` 描述一个 **swapfile**（不是 swap 分区），默认 4G，放在系统盘根分区：
 
 ```sh
 swapctl status               # 当前 swap 与内存
@@ -125,11 +125,11 @@ swapctl resize 8192          # 改成 8192MB：swapoff → 删旧文件 → 改�
 - 根分区没扩容时 4G 建不出来，`swapon` 会失败。先按 [install.md](install.md) 第 8 节扩容，或先 `swapctl resize 512`。
 - 升到 8G 内存后不需要这么大：`swapctl resize 2048`，或把 `enabled` 设 `0` 后 `swapoff /swapfile`。
 - `/etc/config/swap` 里的 `zram` / `zram_percent` 当前**未被 `swapctl` 读取**，本固件也没有打包 `zram-swap`。想要压缩内存要自己装：`apk update && apk add zram-swap`。
-- swapfile 落在傲腾上会持续写入；傲腾耐久远高于普通 TLC，但别把 `swappiness` 调高。
+- swapfile 会持续写入系统盘；NVMe 耐久通常足够，但仍不建议把 `swappiness` 调高。
 
 ## 4. 数据盘与 docker 数据目录
 
-固件**不会**自动分区、格式化或挂载任何数据盘（刻意为之，防误格式化）。500G 机械盘要自己接管。
+固件**不会**自动分区、格式化或挂载任何数据盘（刻意为之，防误格式化）。数据盘需自行接管。
 
 ### 4.1 认出数据盘
 
@@ -138,7 +138,7 @@ cat /proc/partitions
 block info 2>/dev/null | head -30      # 有 block-mount 时看 UUID/标签/挂载点
 ```
 
-16G 的 `nvme0n1` 是系统盘，**任何写操作都不要指向它**。500G 机械盘通常是 `/dev/sda`——容量对得上才动手。
+系统盘（通常是 `nvme0n1`）**任何写操作都不要指向它**。数据盘常见为 `/dev/sda`，动手前用容量与分区表双重确认。
 
 ### 4.2 分区 + 格式化（会清空该盘）
 
@@ -184,7 +184,7 @@ docker info 2>/dev/null | grep -i 'docker root dir'
 
 - 改了 `data_root` 旧镜像/容器不会自动跟过来，必须先 `rsync` 再切，否则 docker 当空环境处理。
 - 数据盘没挂上就启动 docker，容器会把根分区写满。确认 `fstab` 条目 `enabled=1`，开机顺序由 block-mount 早于 dockerd（START=99）保证。
-- 机械盘随机 I/O 差，数据库类容器会明显变慢；swap 已经刻意留在傲腾上。
+- 机械盘随机 I/O 差，数据库类容器会明显变慢；swap 刻意留在系统盘（NVMe）上。
 
 ## 5. 备份与回滚
 
@@ -192,7 +192,7 @@ docker info 2>/dev/null | grep -i 'docker root dir'
 
 | 层级 | 手段 | 影响范围 |
 |---|---|---|
-| 配置回滚 | `sysupgrade -r` 恢复备份 / `wanmode apply` / `campus-guard clear` | 只动配置，几秒生效 |
+| 配置回滚 | `sysupgrade -r` 恢复备份 / `wanmode apply` / `ruijie-guard clear` | 只动配置，几秒生效 |
 | 固件回滚 | 重刷上一版 `*ext4-combined-efi.img.gz` | 整盘覆盖，**数据全丢** |
 | 救砖 | Live U 盘挂根分区改配置 | 只改文件，不重刷 |
 
@@ -207,10 +207,10 @@ sysupgrade -r /tmp/cfg-2026-11-02.tar.gz          # 恢复
 单项回滚：
 
 ```sh
-campus-guard clear                        # 删防检测规则段
+ruijie-guard clear                        # 删防检测规则段
 wanmode apply home                        # WAN 回 DHCP
 swapctl resize 2048                       # swap 调小
-uci set campus-guard.globals.enabled='0'; uci commit campus-guard
+uci set ruijie-guard.globals.enabled='0'; uci commit ruijie-guard
 ```
 
 ### 5.3 固件回滚（保留旧镜像）
@@ -251,7 +251,7 @@ uci commit nikki
 /etc/init.d/nikki restart
 ```
 
-白名单清单在 `/etc/nikki/ruleset/proxy-whitelist.yaml`（按行加域名，文件管理器可编辑）；自定义策略写 `/etc/nikki/mixin.yaml`，订阅更新不会冲掉它。校园网环境下建议先让认证跑通，再启用代理。
+白名单清单在 `/etc/nikki/ruleset/proxy-whitelist.yaml`（按行加域名，文件管理器可编辑）；自定义策略写 `/etc/nikki/mixin.yaml`，订阅更新不会冲掉它。认证环境下建议先让认证跑通，再启用代理。
 
 ## 7. 日常维护命令
 
@@ -260,7 +260,7 @@ logread -e minieap -f               # 认证日志
 logread -e wandetect                # 探测日志（同时写 /var/log/wandetect.log）
 logread -e firewall                 # fw4 reload 报错
 /etc/init.d/network reload           # 改完 network / wanprofile 后
-/etc/init.d/firewall reload          # 改完防火墙 / campus-guard 后
+/etc/init.d/firewall reload          # 改完防火墙 / ruijie-guard 后
 /etc/init.d/wandetect restart        # 探测服务（procd 托管）
 uptime; free -m; df -h               # 资源三连
 sensors 2>/dev/null | head -20       # 温度（lm-sensors）

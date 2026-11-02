@@ -1,12 +1,12 @@
 # 刷写与首次启动
 
-> ⚠️ 刷写会清空目标磁盘上的全部分区与数据，且不可撤销。开始前确认：目标盘是 **16G 傲腾**，500G 机械盘和数据都另存好了。
+> ⚠️ 刷写会清空目标磁盘上的全部分区与数据，且不可撤销。开始前确认：目标盘就是要写入的系统盘，其他磁盘上的数据都已另存。
 
 ## 1. 前提与 BIOS 设置
 
 | 项目 | 要求 |
 |---|---|
-| 目标盘 | 16G 傲腾（M.2 NVMe），写入后整盘被覆盖 |
+| 目标盘 | M.2 NVMe 系统盘（容量任意），写入后整盘被覆盖 |
 | 启动模式 | UEFI（不要 CSM / Legacy） |
 | Secure Boot | **关闭**（本镜像未签名，开启会拒绝引导） |
 | SATA 模式 | AHCI |
@@ -64,9 +64,9 @@ diskutil eject /dev/diskN
 Ventoy 适合「一只 U 盘同时放 Live 系统和固件镜像」，注意两点：
 
 1. Ventoy 数据分区里放**解压后的 `.img`**（`gunzip -k "$IMG"`），放 `.img.gz` 也行，但启动后在 Live 系统里要自己解压。
-2. Ventoy 直接用「img 模式」引导这个镜像时，系统运行在内存/虚拟盘上，**改动重启即丢**，只适合验证硬件能不能点亮。要真正装到傲腾，请照第 4 节在 Live 环境里用 `dd` 写盘。
+2. Ventoy 直接用「img 模式」引导这个镜像时，系统运行在内存/虚拟盘上，**改动重启即丢**，只适合验证硬件能否点亮。要真正写入系统盘，请照第 4 节在 Live 环境里用 `dd` 写盘。
 
-## 4. 装到 16G 傲腾（推荐流程）
+## 4. 写入系统盘（推荐流程）
 
 镜像是一整块磁盘镜像（含 GPT + EFI 分区 + ext4 根），必须**整盘写入**，不能拷成文件。
 
@@ -74,7 +74,7 @@ Ventoy 适合「一只 U 盘同时放 Live 系统和固件镜像」，注意两�
 2. 找到镜像文件和目标盘：
 
 ```sh
-lsblk -o NAME,SIZE,MODEL,SERIAL          # 16G 的 NVMe 就是目标盘，通常是 /dev/nvme0n1
+lsblk -o NAME,SIZE,MODEL,SERIAL          # 按容量与型号确认目标盘，通常是 /dev/nvme0n1
 sudo nvme list                            # 装了 nvme-cli 时用它二次确认型号
 ```
 
@@ -85,7 +85,7 @@ sudo gunzip -c /media/*/immortalwrt-*.img.gz | sudo dd of=/dev/nvme0n1 bs=4M sta
 sync
 ```
 
-4. 关机、拔掉 U 盘、从傲腾启动（BIOS 里把 `UEFI: <傲腾型号>` 调到第一启动项）。
+4. 关机、拔掉 U 盘、从系统盘启动（BIOS 里把 `UEFI: <磁盘型号>` 调到第一启动项）。
 
 ## 5. 首次启动会做什么
 
@@ -105,7 +105,7 @@ sync
 
 ```sh
 cat /etc/config/uci-defaults-log.txt
-df -h /                # 根分区是否已撑满 16G
+df -h /                # 根分区是否已撑满整个系统盘
 free -m                # swap 是否起来了
 ```
 
@@ -131,11 +131,11 @@ apk --version                       # 25.12 用 apk 管包，不是 opkg
 
 ## 7. 接线顺序（重要）
 
-1. 先只接 LAN，进后台、设密码、配好校园网账号（[campus.md](campus.md)）。
-2. 再把校园网网线插 **eth0**。
-3. `wanmode apply campus`（或 LuCI 里把 WAN 协议设为 minieap）。
+1. 先只接 LAN，进后台、设密码、配好认证账号（[ruijie.md](ruijie.md)）。
+2. 再把锐捷认证网络网线插 **eth0**。
+3. `wanmode apply ruijie`（或 LuCI 里把 WAN 协议设为 minieap）。
 
-WAN 出厂是 `proto none` + `auto 0`：**插上网线也不会自己发包**，所以不会因为「先插了校园网」而失联。
+WAN 出厂是 `proto none` + `auto 0`：**插上网线也不会自己发包**，所以不会因为「先插了认证网络」而失联。
 
 ## 8. 根分区扩容（自动失败时手工做）
 

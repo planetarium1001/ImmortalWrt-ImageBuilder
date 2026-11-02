@@ -15,7 +15,7 @@ grep -q "与 ImmortalWrt 官方没有关联" "$U" && echo "ok: 上游免责原�
 grep -q "wukongdaily" "$U" && echo "ok: 含上游作者署名" || { echo "FAIL: 上游署名丢失"; FAIL=1; }
 
 # 上游文件不应出现本项目专有内容，否则说明被误改
-if grep -q "campus-guard\|N5105 v5 四网口" "$U"; then
+if grep -q "ruijie-guard\|N5105 v5 四网口" "$U"; then
 	echo "FAIL: README.upstream.md 被写入了本项目的定制内容"; FAIL=1
 else
 	echo "ok: 上游 README 未被混入定制内容"

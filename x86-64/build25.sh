@@ -54,7 +54,7 @@ PACKAGES="$PACKAGES luci-i18n-filemanager-zh-cn"
 # 合并imm仓库以外的第三方插件 暂时注释
 PACKAGES="$PACKAGES $CUSTOM_PACKAGES"
 
-# ============= 校园网/便携路由必备组件 =============
+# ============= 锐捷认证网络/便携路由必备组件 =============
 # 认证：minieap(锐捷 v3) + 官方 LuCI 协议页；luci-compat 是 Lua proto handler 的依赖
 PACKAGES="$PACKAGES minieap luci-proto-minieap luci-i18n-minieap-zh-cn luci-compat"
 # 网络与分发：NAT66 用原生 masq6，此处只补内核与工具

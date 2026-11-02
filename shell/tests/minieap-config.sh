@@ -11,18 +11,18 @@ FAIL=0
 
 : >"$UCI_STUB_DB"
 cat >>"$UCI_STUB_DB" <<DB
-wanprofile.campus=profile
-wanprofile.campus.proto=minieap
-wanprofile.campus.username=20230001
-wanprofile.campus.password=p@ss w0rd'x
-wanprofile.campus.module=rjv3
-wanprofile.campus.dhcp_type=1
+wanprofile.ruijie=profile
+wanprofile.ruijie.proto=minieap
+wanprofile.ruijie.username=20230001
+wanprofile.ruijie.password=p@ss w0rd'x
+wanprofile.ruijie.module=rjv3
+wanprofile.ruijie.dhcp_type=1
 wanprofile.home=profile
 wanprofile.home.proto=dhcp
-wanprofile.globals.active=campus
+wanprofile.globals.active=ruijie
 DB
 
-PATH=/tmp/mi-bin:$PATH sh "$ROOT/files/usr/sbin/wanmode" apply campus >/dev/null 2>&1
+PATH=/tmp/mi-bin:$PATH sh "$ROOT/files/usr/sbin/wanmode" apply ruijie >/dev/null 2>&1
 proto=$(sed -n 's/^network\.wan\.proto=//p' "$UCI_STUB_DB" | tail -1)
 user=$(sed -n 's/^network\.wan\.username=//p' "$UCI_STUB_DB" | tail -1)
 mod=$(sed -n 's/^network\.wan\.module=//p' "$UCI_STUB_DB" | tail -1)

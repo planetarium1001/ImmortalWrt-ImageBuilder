@@ -1,13 +1,13 @@
 #!/bin/sh
-# campus-guard —— 校园网防检测规则段的生成/清除
-#   campus-guard apply     写入规则段并 reload firewall
-#   campus-guard clear     删除规则段并 reload firewall
-#   campus-guard status    当前状态与规则摘要
-#   campus-guard show      仅打印将写入的规则（dry-run，便于测试）
+# ruijie-guard —— 锐捷认证网络防检测规则段的生成/清除
+#   ruijie-guard apply     写入规则段并 reload firewall
+#   ruijie-guard clear     删除规则段并 reload firewall
+#   ruijie-guard status    当前状态与规则摘要
+#   ruijie-guard show      仅打印将写入的规则（dry-run，便于测试）
 FW=/etc/firewall.user
-BEGIN='# BEGIN campus-guard'
-END='# END campus-guard'
-cfg() { uci -q get "campus-guard.globals.$1" 2>/dev/null; }
+BEGIN='# BEGIN ruijie-guard'
+END='# END ruijie-guard'
+cfg() { uci -q get "ruijie-guard.globals.$1" 2>/dev/null; }
 
 # WAN 设备名从 network 读，避免写死 eth0
 wan_dev() {
@@ -22,7 +22,7 @@ rules() {
 	ttl=$(cfg ttl_clamp); [ -n "$ttl" ] || ttl=64
 	# log_drop 打开时给丢弃规则加 log 前缀，便于现场确认"到底是谁在探测"
 	if [ "$(cfg log_drop)" = "1" ]; then
-		LOGPFX='log prefix "campus-guard drop: " '
+		LOGPFX='log prefix "ruijie-guard drop: " '
 	else
 		LOGPFX=''
 	fi
@@ -50,7 +50,7 @@ R
 }
 
 apply() {
-	[ "$(cfg enabled)" = "1" ] || { echo "campus-guard disabled"; [ -f "$FW" ] && sed -i "/^$BEGIN/,/^$END/d" "$FW"; return 0; }
+	[ "$(cfg enabled)" = "1" ] || { echo "ruijie-guard disabled"; [ -f "$FW" ] && sed -i "/^$BEGIN/,/^$END/d" "$FW"; return 0; }
 	touch "$FW"
 	sed -i "/^$BEGIN/,/^$END/d" "$FW"
 	{
@@ -59,13 +59,13 @@ apply() {
 		echo "$END"
 	} >>"$FW"
 	/etc/init.d/firewall reload >/dev/null 2>&1 || fw4 reload >/dev/null 2>&1
-	echo "campus-guard applied"
+	echo "ruijie-guard applied"
 }
 
 clear() {
 	[ -f "$FW" ] && sed -i "/^$BEGIN/,/^$END/d" "$FW"
 	/etc/init.d/firewall reload >/dev/null 2>&1 || fw4 reload >/dev/null 2>&1
-	echo "campus-guard cleared"
+	echo "ruijie-guard cleared"
 }
 
 status() {
@@ -83,5 +83,5 @@ case "$1" in
 	clear) clear ;;
 	status) status ;;
 	show) rules ;;
-	*) echo "usage: campus-guard apply|clear|status|show" >&2; exit 2 ;;
+	*) echo "usage: ruijie-guard apply|clear|status|show" >&2; exit 2 ;;
 esac

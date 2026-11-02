@@ -11,7 +11,7 @@ if [ ! -d "$D" ]; then
 	exit 2
 fi
 
-for f in README.md install.md campus.md network.md ops.md compliance.md packages.md; do
+for f in README.md install.md ruijie.md network.md ops.md compliance.md packages.md; do
 	if [ -s "$D/$f" ]; then echo "ok: $f"; else echo "FAIL: 缺少或为空 $f"; FAIL=1; fi
 done
 
@@ -21,12 +21,12 @@ need() { # 文件 关键词 说明
 need install.md "dd " "dd 刷写命令"
 need install.md "Ventoy\|Etcher" "U 盘工具"
 need install.md "192.168.100.1" "管理地址"
-need campus.md "minieap" "minieap 配置"
-need campus.md "rjv3" "锐捷 v3 模块"
+need ruijie.md "minieap" "minieap 配置"
+need ruijie.md "rjv3" "锐捷 v3 模块"
 need network.md "masq6\|NAT66" "NAT66 说明"
 need network.md "AP" "AP 模式说明"
 need ops.md "wanmode" "profile 切换"
-need ops.md "campus-guard" "防检测开关"
+need ops.md "ruijie-guard" "防检测开关"
 need ops.md "swapctl" "swap 调整"
 need ops.md "回滚" "回滚步骤"
 need compliance.md "责任\|条款" "合规声明"

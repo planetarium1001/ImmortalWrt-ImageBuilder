@@ -4,7 +4,7 @@
 
 | `ethX` | 角色 | 说明 |
 |---|---|---|
-| `eth0` | WAN | 接校园网墙口（或家里的光猫 / 上级路由） |
+| `eth0` | WAN | 接认证网络墙口（或家里的光猫 / 上级路由） |
 | `eth1` | LAN | 接 AX3000T 的上联口（AP 模式） |
 | `eth2` | LAN | 预留（可直接接电脑 / NAS） |
 | `eth3` | LAN | 预留 |
@@ -98,7 +98,7 @@ uci commit dhcp
 
 ## 5. IPv6：为什么用 NAT66
 
-校园网一般只给 WAN 侧一个地址段，**不下发 PD（前缀委派）**，所以内网终端拿不到公网 IPv6——这就是「路由器自己有 IPv6、手机却没有」的原因（iStoreOS 上踩过同一个坑）。
+认证网络一般只给 WAN 侧一个地址段，**不下发 PD（前缀委派）**，所以内网终端拿不到公网 IPv6——这就是「路由器自己有 IPv6、手机却没有」的原因（iStoreOS 上踩过同一个坑）。
 
 本固件用 NAT66 解决，三件套都是 fw4 / netifd 原生能力：
 
@@ -108,20 +108,20 @@ uci commit dhcp
 | 内网分发 | LAN `ip6assign 60` + `ra server` + `dhcpv6 server` | `network.lan`、`/etc/config/dhcp` |
 | 出口地址转换 | 防火墙 wan 区域 `option masq6 '1'`（SNAT66） | `/etc/config/firewall` |
 
-效果：终端拿到 `fd7a:6e64:6c35:xxxx::/64` 的地址，出网时源地址被换成 WAN 侧的校园地址，**校园侧只看到软路由一个 IPv6**。不做 relay、不请求 PD，`/etc/config/dhcp` 里 LAN 的 `ndp` 是 `disabled`，避免把终端地址暴露出去。
+效果：终端拿到 `fd7a:6e64:6c35:xxxx::/64` 的地址，出网时源地址被换成 WAN 侧的接入地址，**接入侧只看到软路由一个 IPv6**。不做 relay、不请求 PD，`/etc/config/dhcp` 里 LAN 的 `ndp` 是 `disabled`，避免把终端地址暴露出去。
 
 代价（必须知道）：
 
 - 外网**无法主动连进终端**：BT/PT 做种、部分游戏语音、自建服务（NAS 外网访问）会退化或不通。
 - 某些网站/应用按 IPv6 判设备，可能与 IPv4 表现不一致；出问题先试 `curl -4`。
-- NAT66 与「校园按设备数计费」的策略天然冲突，是否使用见 [compliance.md](compliance.md)。
+- NAT66 与「按设备数计费」的策略天然冲突，是否使用见 [compliance.md](compliance.md)。
 
 验证：
 
 ```sh
 # 路由器侧
 ip -6 addr show br-lan | grep fd7a          # 内网有 ULA 网关地址
-ip -6 addr show eth0 | grep 'scope global'  # WAN 有校园下发的 v6（没有说明校园没给 v6）
+ip -6 addr show eth0 | grep 'scope global'  # WAN 有下发的 v6（没有说明上级没给 v6）
 fw4 print 2>/dev/null | grep -iE 'masq6|masquerade'
 
 # 终端侧（电脑/手机）
@@ -161,7 +161,7 @@ cat /etc/config/custom_router_ip.txt
 
 | 场景 | 操作 |
 |---|---|
-| 校园网（锐捷认证） | `wanmode apply campus`，见 [campus.md](campus.md) |
+| 锐捷认证 | `wanmode apply ruijie`，见 [ruijie.md](ruijie.md) |
 | 家里 DHCP（光猫拨号） | `wanmode apply home`（`home` 出厂是 `proto dhcp`） |
 | 家里 PPPoE（自己拨号） | 先改 `home` 的实现方式再应用：见下面 |
 | 临时/酒店 | `wanmode apply adhoc`，再按酒店要求做 Portal 登录 |

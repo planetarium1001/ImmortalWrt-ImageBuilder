@@ -26,7 +26,7 @@ done
 [ "$FAIL" = "0" ] && echo "ok: 无无关机型关键词"
 
 # 索引里的文档必须真实存在
-for f in install campus network ops compliance packages README; do
+for f in install ruijie network ops compliance packages README; do
 	[ -s "$ROOT/x86-64/docs/n5105/$f.md" ] || { echo "FAIL: 文档缺失 $f.md"; FAIL=1; }
 done
 echo "ok: 文档索引指向的文件均存在"

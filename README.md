@@ -1,144 +1,103 @@
-# [新手指导](https://github.com/wukongdaily/AutoBuildImmortalWrt/wiki) 👈🏻
-# ImmortalWrt-ImageBuilder
+# N5105 四网口 i226 固件构建
 
-**⚠️ 重要声明**
+面向单一硬件的 ImmortalWrt 固件构建仓库：**N5105 v5，4× Intel i226-V 2.5G，x86-64，UEFI**。
 
-> **本项目为个人独立维护的第三方项目(脚本)，与 ImmortalWrt 官方没有关联。** <br>
-> **项目中使用了 ImmortalWrt 官方 ImageBuilder 工具打包生成固件。<br>
-> 但用户自行定制产生的任何 bug，均不代表 ImmortalWrt 官方固件的 bug**<br>
-> **为了不给 ImmortalWrt 上游维护者增加额外负担和麻烦，所有相关问题请勿在 ImmortalWrt 群内反馈**。  <br>
-> **建议各位在本项目 [Discussions](https://github.com/wukongdaily/ImmortalWrt-ImageBuilder/discussions) 中提问或讨论**
+用途：锐捷认证接入、IPv4/IPv6 双栈分发、透明代理、容器与商店生态，可在不同网络环境间迁移使用。
 
+## 与上游的关系
 
----
+- 本仓库 fork 自 [wukongdaily/AutoBuildImmortalWrt](https://github.com/wukongdaily/AutoBuildImmortalWrt)，沿用其 ImageBuilder + GitHub Actions 构建方式。
+- 固件本体由 [ImmortalWrt](https://github.com/immortalwrt/immortalwrt) 官方 ImageBuilder 生成，版本 `25.12.2`，内核 `6.12`。
+- 上游 README 原样保留于 [README.upstream.md](README.upstream.md)；上游第三方软件清单见 [PACKAGES.upstream.md](PACKAGES.upstream.md)。
+- 本项目为第三方定制，**与 ImmortalWrt 官方无关**。由本项目定制产生的问题请勿反馈给 ImmortalWrt 官方或上游仓库。
 
-[![GitHub](https://img.shields.io/github/license/wukongdaily/AutoBuildImmortalWrt.svg?label=LICENSE&logo=github&logoColor=%20)](https://github.com/wukongdaily/AutoBuildImmortalWrt/blob/master/LICENSE)
-![GitHub Stars](https://img.shields.io/github/stars/wukongdaily/AutoBuildImmortalWrt.svg?style=flat&logo=appveyor&label=Stars&logo=github)
-![GitHub Forks](https://img.shields.io/github/forks/wukongdaily/AutoBuildImmortalWrt.svg?style=flat&logo=appveyor&label=Forks&logo=github)
+## 相对上游的改动
 
-## 🤔 这是什么？
-基于 CI 的 ImageBuilder 工作流，用于自动化构建 ImmortalWrt 固件。
-> 1、支持自定义固件大小 默认1GB 不建议设置过大 推荐1G-2G 更大需求可通过自定义插件里的扩容插件自行扩容<br>
-> 2、支持可选预安装docker（可选）支持在UI上勾选是否集成商店 （24.10.6以下）<br>
-> 3、支持按需增加[第三方软件](https://github.com/wukongdaily/store/blob/master/README.md)  如何集成 https://github.com/wukongdaily/AutoBuildImmortalWrt/discussions/209 <br>
-> 4、点击这里查看👉🏻[全部支持的机型列表](https://github.com/wukongdaily/AutoBuildImmortalWrt/blob/master/SUPPORT.md) 👈🏻<br>
-> 5、在UI上 新增luci版本的可选项，默认最新版25.12.x https://github.com/wukongdaily/AutoBuildImmortalWrt/discussions/426<br>
-> 6、支持设置管理地址的ip 比如192.168.100.1 这里强调 这项功能仅针对多网口机型 单网口的逻辑还是自动获取ip模式（dhcp）无固定ip<br>
-> 7、对于[插件追新的用户 建议前往run项目 下载run后 ](https://github.com/wukongdaily/RunFilesBuilder/discussions/41)用命令sh xx.run 覆盖安装 <br>
-> 8、支持24.10.x 、25.12.x 等版本 （包括x86-64-ISO、x86-64、rockchip、全志sunxi、无线路由器）
+| 方向 | 改动 |
+|---|---|
+| 目标 | 移除其余 9 个平台目录与全部非 x86-64 workflow，只保留本机型 |
+| 文件系统 | 新增 ext4 根（上游 squashfs 产物并存，实际刷写用 ext4），首启自动扩满系统盘 |
+| 端口 | 按 MAC / PCI 槽位固定角色，不依赖内核枚举顺序 |
+| 认证 | 内置 minieap（锐捷 v3），WAN 多探针投票后按需触发 |
+| IPv6 | ULA 前缀 + `masq6`（NAT66），终端地址对上级网络不可见 |
+| 防护 | `ruijie-guard` 规则集，可整体启用 / 撤销 |
+| 代理 | nikki（mihomo）走上游 apk 源，白名单透明代理 |
+| 迁移 | 多站点 profile 一键切换（认证网络 / 家用 / 临时） |
+| 运维 | 参数文件与开关均可在 LuCI 内修改，无需重刷 |
 
-## [基本用法步骤](https://github.com/wukongdaily/AutoBuildImmortalWrt/wiki) 👈🏻
-1、fork本项目<br>
-2、在fork后的项目中 点击【action】 找到需要的工作流后 run-workflow<br>
+## 快速开始
 
-## 虚拟机建议用哪条工作流？下图↓
-<img width="30%" height="30%" alt="image" src="https://github.com/user-attachments/assets/743027e0-584a-4842-bfb3-0dff22de9101" /> <br>
-虚拟机用户建议直接构建ISO镜像 此过程分2个阶段 阶段一构建固件imm 阶段二将其封装iso格式的安装器 总计耗时大约7-8分钟  <br>
-ISO在虚拟机引导后 跑码结束后，在命令行输入 `ddd` 按提示 完成虚拟磁盘的写入（安装immortalwrt到虚拟磁盘）<br>
-这样做也比较灵活 避免了格式转换和解压 同时还可以指定安装某个磁盘 而安装后的磁盘剩余空间也能加以利用。<br>
-详细的解说 可以参考我的另一个项目 [img-installer](https://github.com/wukongdaily/armbian-installer) 
+1. Fork 本仓库。
+2. Actions 中选择 **Build N5105 x86_64 25.12.x**，Run workflow。
+3. 填写参数：
+   - `luci_version`：`25.12.2`（workflow 默认值即为该版本）
+   - `custom_router_ip`：管理地址，默认 `192.168.100.1`
+   - `profile`：`2G`（首启自动扩满整盘）
+   - `include_docker`：按需
+   - `enable_store`：按需
+   - 拨号不在构建期配置：锐捷认证与家用 PPPoE 均由设备上的站点 profile 切换（见[运维手册](x86-64/docs/n5105/ops.md)）
+4. 从 Release 下载 `immortalwrt-25.12.2-n5105-x86-64-generic-ext4-combined-efi.img.gz`（机型标识在前缀，`ext4-combined-efi` 在尾部）。
+5. 按 [安装手册](x86-64/docs/n5105/install.md) 刷写并进入后台。
 
-## 虚拟机用户使用的教学⬇️ ISO 
-[![操作步骤](https://img.shields.io/badge/YouTube-123456?logo=youtube&labelColor=ff0000)](https://www.youtube.com/watch?v=ftSE3wSJi64) [![Bilibili](https://img.shields.io/badge/Bilibili-123456?logo=bilibili&logoColor=fff&labelColor=fb7299)](https://www.bilibili.com/video/BV1enxMzwEUe/) <br>
-【绿联NAS安装immortalwrt25.12】https://www.bilibili.com/video/BV1AyZcBsErt/
+## 写入后开机
 
-## 物理机如何使用ISO格式的安装器(本项目独有)
-- Windows 建议将ISO拷贝到制作好的[Ventoy](https://www.ventoy.net/cn/index.html)<br>
-  <img width="303" height="90" alt="image" src="https://github.com/user-attachments/assets/34d73e24-3100-4c0d-a904-5f114d867793" />
+镜像写入系统盘并首次开机后，下列动作自动完成，无需交互：
 
-- macOS 使用[balenaEtcher](https://etcher.balena.io/) 将ISO 刻录到U盘即可<br>
-  <img width="285" height="188" alt="image" src="https://github.com/user-attachments/assets/cd09be82-2670-404c-8878-c2782b3c8374" />
+1. **根分区扩满系统盘**：从 `/proc/mounts` 反查根设备并解析磁盘与分区号（兼容 `sda1` / `nvme0n1p2` / `mmcblk0p2`），`parted resizepart 100%` 扩分区，失败回退 `sfdisk`，随后 `resize2fs` 在线扩容并回读校验。系统盘容量任意，不绑定固定规格。
+2. **网口绑定角色**：按 MAC / PCI 槽位把 `eth0` 定为 WAN，`eth1`–`eth3` 桥入 `br-lan`，与枚举顺序无关。
+3. **写入管理地址**：取构建参数 `custom_router_ip`，缺省 `192.168.100.1`。
+4. **WAN 保持关闭**：`proto none` + `auto 0`，不主动发送探测包。
+5. **服务就绪**：启用 ttyd、SSH、dnsmasq、防火墙，并完成设备侧初始化。
 
-- 将制作好的U盘提前插在软路由 然后启动后 按Del 或者F12、F11、F7等 使U盘成为第一启动盘
+日志写入 `/etc/config/uci-defaults-log.txt`；脚本执行成功后自删，不会重复运行。完成后浏览器打开 `http://192.168.100.1`，用户 `root`，密码为空。
 
-  <img width="50%" alt="image" src="https://github.com/user-attachments/assets/a1ba38d9-305c-41dd-8441-9e61c3dcae1d" /> <br>
-- 启动后在命令行输入 ddd 按提示 完成硬盘的写入 硬盘剩余空间你还可以自动分配<br>
-- ISO安装器原理 点这里查看 https://github.com/wukongdaily/img-installer
-- [视频教学参考 精准空降到 13:46 ](https://www.bilibili.com/video/BV1DQXVYFENr/?share_source=copy_web&vd_source=0bb92241fb28a55c32c2e5132116b594&t=826)
-- 这是一个值得推广的方法 真心希望你能吸收、学会 费了很大心思的。没错、从今往后 [任何OpenWrt都有安装器了](https://github.com/wukongdaily/img-installer)
+## 注意事项
 
-## 如何查询imm仓库内有哪些插件
-https://mirrors.sjtug.sjtu.edu.cn/immortalwrt/releases/24.10.4/packages/x86_64/luci/
-## 如何查询imm仓库外目前可以集成哪些插件
-https://github.com/wukongdaily/store
-> 具体方法 https://github.com/wukongdaily/AutoBuildImmortalWrt/discussions/209
-## 【视频教程】如何集成第三方插件？
-https://www.youtube.com/watch?v=KN6AJYV1hBI <br>
-https://www.youtube.com/watch?v=7i6BQeitUtE
+- **先接 LAN、后接 WAN**：首次启动只插 `eth1`（接 AP 或电脑），配好认证参数后再把上级网线插入 `eth0`。
+- **首次登录立即改密码**：出厂无密码，`passwd` 设置后再接入网络。
+- **上级设备关闭 DHCP**：AP 需工作在 AP / 桥接模式，否则两个 DHCP 抢答，表现为能连 WiFi 但无法上网。
+- **管理网段可能撞段**：`192.168.100.0/24` 与部分光猫维护地址重叠；撞段时按[安装手册](x86-64/docs/n5105/install.md)手工改址。
+- **刷写不可逆**：写入会清空目标盘全部分区，刷前确认盘符并备份数据。
+- **请勿接入其余设备**：首次开机的扩容为程序自己判断，不建议接入不必要的硬盘、存储设备等，以免造成错误的格式化和数据损坏。
+- **扩容期间勿断电**：首次开机扩容未完成即断电，根分区会停在镜像大小，需按文档手工 `resize2fs`。
+- **代理默认关闭**：nikki 出厂 `enabled=0`，先让认证跑通再启用。
 
-## 旁路由的用户必读
-近期不少用户修改配置文件中的默认ip地址，误认为这个工作流可以直接设置旁路ip。这是巨大的误解，这样设置就乱套了。<br>
-旁路的逻辑应该是单网口模式。根据下面的固件属性可知。单网口默认采取`dhcp模式`，用户应当自行在上一级路由器查看给imm路由器分配的ip地址。
-然后通过该ip来访问imm后台页面，在imm后台页面中，根据自己主路由的网段 自行配置旁路的ip地址。
+## 内置软件
 
-## 正常路由模式必读
-所谓正常的路由模式 就是指多网口用户，多网口的意思就是2个或者2个以上网口的情况。<br>
-一般wan用于拨号或者自动获取ip <br>
-而其他lan一般是给其他设备分配dhcp<br>
-这种情况下 你可以修改路由器的默认ip  `192.168.100.1` 比如你可以修改为`192.168.80.1 ` 诸如此类。<br>
-没错，修改此ip 无非就是为了避免跟光猫或者跟家庭中的其他路由器网段冲突。大多数用户，无需更改。
+在 ImmortalWrt 官方源基础上追加，完整清单与上游链接见[内置软件说明](x86-64/docs/n5105/packages.md)。
 
-## 该固件默认属性？(必读)
-- 该固件刷入【单网口设备】默认采用DHCP模式,自动获得ip。类似NAS的做法
-- 该固件刷入【多网口设备】默认WAN口采用DHCP模式，LAN 口ip为  `192.168.100.1` <br>其中eth0为WAN 其余网口均为LAN
-- 若用户在工作流中勾选了拨号信息 则WAN口模式为pppoe拨号模式。
-- 建议拨号用户使用之前重启一次光猫。
-- 综合上述特点，【单网口设备】应该先接路由器，先在上级路由器查看一下它的ip 再访问。
-- 上述特点 你都可以通过 `99-custom.sh` 配置和调整
+- 认证：minieap（锐捷 v3）+ LuCI 协议页
+- 代理：nikki（mihomo 内核），走 nikki 自有 apk 源
+- 容器：dockerd、docker-compose、luci-app-dockerman
+- 共享：samba4、minidlna、openlist、diskman、hd-idle
+- 运维：argon 主题、ttyd、filemanager、commands、package-manager、nlbwmon、vnstat2、statistics、watchcat、autoreboot
+- 网络：BBR、FullCone NAT、nft-tproxy/tun 内核模块、ip-full、ethtool-full、irqbalance
+- 调试：htop、iftop、tcpdump、iperf3、bind-dig、lm-sensors、smartmontools、nvme-cli
+- 存储与分区：parted、sfdisk、e2fsprogs、zram-swap
+- 拨号：ppp / ppp-mod-pppoe（由站点 profile 启用）
 
-## 特别说明
-本项目构建的固件 为了易用性 wan口防火墙规则入站 是开启的，待首次调试完毕后，建议自行关闭。操作方法如下
-网络——防火墙—— wan 的入站 选择拒绝 然后保存并应用即可。更多讨论[ 请参考这个话题](https://github.com/wukongdaily/AutoBuildImmortalWrt/discussions/341)
-<img width="3860" height="870" alt="image" src="https://github.com/user-attachments/assets/d826bccd-f0df-4d4a-877d-b711b81fcf1a" />
-同时此项设置的相关代码详见 `files/etc/uci-defaults/99-custom.sh` 行首
+## 文档
 
-## ❤️其它GitHub Action项目推荐🌟 （建议收藏）⬇️
-- ### [一键生成run插件] 🆕
-- https://github.com/wukongdaily/RunFilesBuilder<br>
-- ### [一键生成docker离线镜像] 🆕
-- https://github.com/wukongdaily/DockerTarBuilder<br>
-- ### [OpenWrt/Armbian IMG安装器ISO] 🆕
-- https://github.com/wukongdaily/img-installer
+- [安装与首次启动](x86-64/docs/n5105/install.md)：写盘、首启动作、进入后台
+- [锐捷认证](x86-64/docs/n5105/ruijie.md)：minieap 配置与排障
+- [网络与端口](x86-64/docs/n5105/network.md)：端口角色、AP 模式、NAT66
+- [内置软件](x86-64/docs/n5105/packages.md)：追加的软件、用途与上游链接
+- [日常运维](x86-64/docs/n5105/ops.md)：profile、防护开关、swap、docker、回滚
+- [使用条款与责任](x86-64/docs/n5105/compliance.md)：合规边界
+- [仓库说明](x86-64/docs/n5105/README.md)：手册总览
 
+## 目录结构
 
-## ❤️如何构建docker版ImmortalWrt（建议收藏）⬇️
-https://wkdaily.cpolar.cn/15
-# 🎉鸣谢
+- `x86-64/`：目标配置、构建脚本、机型手册
+- `files/`：随固件打包的配置与首启脚本
+- `shell/`：第三方包准备、代理源接入、验收测试
+- `.github/workflows/`：构建与清理
 
-感谢以下项目与作者对本项目的贡献与灵感 ❤️
+## 许可与致谢
 
-<div align="left">
+- 许可：[GPL-2.0](LICENSE)
+- 致谢：[wukongdaily/AutoBuildImmortalWrt](https://github.com/wukongdaily/AutoBuildImmortalWrt)（构建框架）、[ImmortalWrt](https://github.com/immortalwrt/immortalwrt)（固件本体）、[updateing/minieap](https://github.com/updateing/minieap)（锐捷认证）、[nikkinikki-org/OpenWrt-nikki](https://github.com/nikkinikki-org/OpenWrt-nikki)（透明代理）
 
-<a href="https://github.com/immortalwrt"><img src="https://avatars.githubusercontent.com/immortalwrt?v=4&s=80" width="80" height="80" alt="immortalwrt" /></a>
-<a href="https://github.com/Openwrt-Passwall"><img src="https://avatars.githubusercontent.com/Openwrt-Passwall?v=4&s=80" width="80" height="80" alt="Openwrt-Passwall" /></a>
-<a href="https://github.com/sirpdboy"><img src="https://avatars.githubusercontent.com/sirpdboy?v=4&s=80" width="80" height="80" alt="sirpdboy" /></a>
-<a href="https://github.com/ophub"><img src="https://avatars.githubusercontent.com/ophub?v=4&s=80" width="80" height="80" alt="ophub" /></a>
-<a href="https://github.com/linkease"><img src="https://avatars.githubusercontent.com/linkease?v=4&s=80" width="80" height="80" alt="linkease" /></a>
+## 免责
 
-<a href="https://github.com/coolsnowwolf"><img src="https://avatars.githubusercontent.com/coolsnowwolf?v=4&s=80" width="80" height="80" alt="coolsnowwolf" /></a>
-<a href="https://github.com/stackia"><img src="https://avatars.githubusercontent.com/stackia?v=4&s=80" width="80" height="80" alt="stackia" /></a>
-<a href="https://github.com/kiddin9"><img src="https://avatars.githubusercontent.com/kiddin9?v=4&s=80" width="80" height="80" alt="kiddin9" /></a>
-<a href="https://github.com/sbwml"><img src="https://avatars.githubusercontent.com/sbwml?v=4&s=80" width="80" height="80" alt="sbwml" /></a>
-<a href="https://github.com/kenzok8"><img src="https://avatars.githubusercontent.com/kenzok8?v=4&s=80" width="80" height="80" alt="kenzok8" /></a>
-
-<a href="https://github.com/timsaya"><img src="https://avatars.githubusercontent.com/timsaya?v=4&s=80" width="80" height="80" alt="timsaya" /></a>
-<a href="https://github.com/AdguardTeam"><img src="https://avatars.githubusercontent.com/AdguardTeam?v=4&s=80" width="80" height="80" alt="AdguardTeam" /></a>
-<a href="https://github.com/Thaolga"><img src="https://avatars.githubusercontent.com/Thaolga?v=4&s=80" width="80" height="80" alt="Thaolga" /></a>
-<a href="https://github.com/eamonxg"><img src="https://avatars.githubusercontent.com/eamonxg?v=4&s=80" width="80" height="80" alt="eamonxg" /></a>
-<a href="https://github.com/nikkinikki-org"><img src="https://avatars.githubusercontent.com/nikkinikki-org?v=4&s=80" width="80" height="80" alt="nikkinikki-org" /></a>
-
-<a href="https://github.com/gdy666"><img src="https://avatars.githubusercontent.com/gdy666?v=4&s=80" width="80" height="80" alt="gdy666" /></a>
-<a href="https://github.com/lwb1978"><img src="https://avatars.githubusercontent.com/lwb1978?v=4&s=80" width="80" height="80" alt="lwb1978" /></a>
-<a href="https://github.com/Tokisaki-Galaxy"><img src="https://avatars.githubusercontent.com/Tokisaki-Galaxy?v=4&s=80" width="80" height="80" alt="Tokisaki-Galaxy" /></a>
-<a href="https://github.com/QiuSimons"><img src="https://avatars.githubusercontent.com/QiuSimons?v=4&s=80" width="80" height="80" alt="QiuSimons" /></a>
-<a href="https://xz.vumstar.com/"><img src="https://xz.vumstar.com/static/img/logo.png" width="80" height="80" alt="wukongdaily" /></a>
-
-</div>
-
-## ❤️赞助作者 ⬇️⬇️
-
-<a href="https://wkdaily.cpolar.top/01" target="_blank">
-  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png"
-       alt="Buy Me A Coffee"
-       style="width:15%; height:auto;">
-</a>
+固件按现状提供，不附带担保。刷写不可逆；网络使用须遵守所接入网络的使用条款，账号与使用责任在持有人。详见[合规说明](x86-64/docs/n5105/compliance.md)。

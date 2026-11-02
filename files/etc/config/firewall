@@ -107,7 +107,7 @@ config rule
 	option family 'ipv6'
 	option target 'ACCEPT'
 
-# campus-guard 的规则段由 /usr/sbin/campus-guard 写入 /etc/firewall.user
+# ruijie-guard 的规则段由 /usr/sbin/ruijie-guard 写入 /etc/firewall.user
 config include
 	option path '/etc/firewall.user'
 	option type 'script'
