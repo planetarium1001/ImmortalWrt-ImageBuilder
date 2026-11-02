@@ -76,7 +76,7 @@
 
 | 包 | 用途 | 来源 |
 |---|---|---|
-| `ppp` / `ppp-mod-pppoe` / `luci-proto-ppp` | 家用宽带拨号（由 profile 切换启用） | 官方源；上游 <https://github.com/ppp-project/ppp> |
+| `ppp` / `ppp-mod-pppoe` / `luci-proto-ppp` | 家用宽带拨号（改 WAN 协议启用） | 官方源；上游 <https://github.com/ppp-project/ppp> |
 
 ## 版本说明
 

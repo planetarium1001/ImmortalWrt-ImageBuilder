@@ -26,14 +26,15 @@ config interface 'lan'
 
 config device 'wan_dev'
 	option name 'eth0'
-	option macaddr ''
 
+# WAN 用原生 dhcp：认证放行后 netifd 的 udhcpc 自然拿到地址。
+# minieap 只做认证，不参与地址分配。
 config interface 'wan'
 	option device 'eth0'
-	option proto 'none'
+	option proto 'dhcp'
 	option auto '0'
 
 config interface 'wan6'
 	option device 'eth0'
-	option proto 'none'
+	option proto 'dhcpv6'
 	option auto '0'

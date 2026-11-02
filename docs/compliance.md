@@ -53,9 +53,9 @@
 出现「认证失败」「账号异常」「被要求到网络中心说明」时，按顺序做：
 
 ```sh
-ruijie-guard clear                 # 1. 先关掉防检测规则（这是最容易引起注意的部分）
-wanmode show                       # 2. 确认当前 WAN 是什么模式
-ifstatus wan                       # 3. 确认认证是否正常
+cat /etc/minieap.conf              # 1. 确认账号与网口配置
+logread -e minieap | tail -20      # 2. 看认证返回了什么
+ifstatus wan                       # 3. 确认有没有拿到地址
 ```
 
 1. 立刻关防检测（上面前两条），恢复到「普通单机上网」状态。

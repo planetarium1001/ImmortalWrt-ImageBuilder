@@ -22,7 +22,7 @@ chk "$DHCP" "ndp 'disabled'" "NDP 关闭（避免终端地址暴露）"
 # 不应出现 relay 模式
 if grep -q "relay" "$DHCP"; then echo "FAIL: 出现了 relay 配置（应停用）"; FAIL=1; else echo "ok: 未使用 IPv6 relay"; fi
 
-# firewall include 指向 /etc/firewall.user，保证 ruijie-guard 生效路径
+# firewall include 指向 /etc/firewall.user（自定义规则入口）
 chk "$FW" "option path '/etc/firewall.user'" "firewall include 指向 /etc/firewall.user"
 
 [ "$FAIL" = "0" ] && echo "NAT66 OK" || echo "NAT66 FAILED"

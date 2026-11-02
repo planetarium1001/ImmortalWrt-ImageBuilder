@@ -1,8 +1,0 @@
-# 防检测总开关与参数。规则段写入 /etc/firewall.user（LuCI 自定义规则页可见）。
-config guard 'globals'
-	option enabled '0'
-	option ttl_clamp '64'
-	option block_leak '1'
-	option wan_input 'drop'
-	# 丢弃时打日志，排查阶段用；正常运行时关掉避免日志膨胀
-	option log_drop '0'

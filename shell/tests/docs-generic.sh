@@ -2,7 +2,7 @@
 # ac-5：文档不含容量绑定与场景绑定描述
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-D="$ROOT/x86-64/docs/n5105"
+D="$ROOT/docs"
 FAIL=0
 
 for kw in "16G" "傲腾" "Optane" "500G"; do

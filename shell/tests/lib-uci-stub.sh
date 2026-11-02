@@ -1,5 +1,5 @@
 #!/bin/sh
-# 测试用的最小 uci 桩：只实现 portmap/wanmode/wandetect/ruijie-guard 用到的子集。
+# 测试用的最小 uci 桩：只实现 portmap/wandetect 用到的子集。
 # 用法：在 PATH 前置一个名为 uci 的可执行脚本，内容为 `exec sh <this> "$@"`
 # 数据文件由 UCI_STUB_DB 指定，格式为 key=value（key 形如 network.wan.proto）。
 uci() {

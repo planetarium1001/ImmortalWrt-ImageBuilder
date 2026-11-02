@@ -1,4 +1,4 @@
-# 运维：profile、防检测、swap、数据盘、回滚
+# 运维：认证与地址、swap、数据盘、回滚
 
 > 本页改的都是持久配置。**动手前先备份**，改完按每节的「验证」确认，再离开后台。
 
@@ -14,99 +14,59 @@ scp root@192.168.100.1:/tmp/cfg-*.tar.gz .
 
 ```sh
 cp -a /etc/config/network /etc/config/network.bak
-uci revert network wanprofile ruijie-guard wandetect swap
+uci revert network minieap wandetect swap
 ```
 
-## 1. 站点 profile 切换（`wanmode`）
+## 1. 认证与地址（minieap 原生配置）
 
-`/etc/config/wanprofile` 里有三个 profile，只改 WAN，不动 LAN 与防火墙：
+认证只有一份配置：`/etc/minieap.conf`。改它不需要动任何脚本或 UCI，也不需要重刷。
 
-| profile | 出厂协议 | 用途 |
+```sh
+vi /etc/minieap.conf          # 或 LuCI 文件管理器在线编辑
+```
+
+必填两项，其余保持注释即可：
+
+```ini
+username=你的账号
+password=你的密码
+nic=eth0
+module=rjv3
+```
+
+改完重启认证：
+
+```sh
+/etc/init.d/minieap restart
+logread -e minieap -f          # 实时看认证过程
+```
+
+**开机自启**已经配好（`/etc/init.d/minieap`），不需要额外 enable。
+
+### 认证与地址是两件事
+
+- **minieap 只做 802.1X 认证**，它不分配 IP，也不管理 IPv6。
+- 地址由 WAN 接口的原生 `proto dhcp` 提供：认证放行后 netifd 自动取到地址、网关、DNS。
+- IPv6 是否下发由网络侧决定，本固件不干预；内网终端的 IPv6 走 ULA + NAT66（见 [network.md](network.md)）。
+
+### 终端手工调试
+
+不启用服务、临时跑一次看输出：
+
+```sh
+/usr/sbin/minieap -u 账号 -p 密码 -n eth0 --module rjv3
+```
+
+成功后再把账号密码写进 `/etc/minieap.conf`，交给 init 脚本托管。
+
+### 常见现象对照
+
+| 现象 | 含义 | 处理 |
 |---|---|---|
-| `ruijie` | `minieap` | 锐捷认证 |
-| `home` | `dhcp` | 家里光猫已拨号 / 上级路由给地址 |
-| `adhoc` | `dhcp` | 酒店、临时环境 |
-
-```sh
-wanmode list                 # 列出可用 profile
-wanmode show                 # active=ruijie proto=minieap user=20230001
-wanmode apply home           # 切家用
-wanmode apply ruijie         # 切回认证网络
-```
-
-改字段（`set <name> <key> <value>`，值含空格要加引号）：
-
-```sh
-wanmode set ruijie username '20230001'
-wanmode set ruijie password 'p@ss w0rd'
-wanmode set ruijie dhcp_type '2'
-wanmode set home proto 'pppoe'          # 想在家 PPPoE 拨号时
-wanmode set home username '宽带账号'
-wanmode set home password '宽带密码'
-```
-
-`wanmode apply` 实际做的事：写 `network.wan.proto`（及 `username`/`password`/`module`/`dhcp_type`/`auto=1`）→ `uci commit` → `ubus call network reload` → 打印 `applied <name> (<proto>)`。切到 `dhcp`/`pppoe` 时会先删掉 `wan.username`/`wan.password`，不会把认证账号带过去。
-
-验证与回滚：
-
-```sh
-ifstatus wan | grep -E '"up"|"proto"|address'
-wanmode show
-wanmode apply ruijie             # 出问题切回来（LAN 没动，切 profile 不会失联）
-```
-
-## 2. 防检测开关（`ruijie-guard`）
-
-### 它就是一段防火墙规则
-
-`/usr/sbin/ruijie-guard` 只做一件事：把带标记的 nft 规则写进 `/etc/firewall.user`（LuCI「网络 → 防火墙 → 自定义规则」可见可改），然后 reload 防火墙。
-
-| UCI 参数 | 作用 | 说明 |
-|---|---|---|
-| `enabled` | 总开关 | `0` 时 `apply` 会**删除**规则段 |
-| `ttl_clamp` | WAN 出向 IPv4 TTL 统一为 `<值>` | 设 `0` 关闭该条；默认 `64` |
-| `block_leak` | 丢弃经 WAN 外发的服务发现/地址分配类报文 | `udp 67/68/137/138/1900/5353/547` + `255.255.255.255` |
-| `wan_input` | 丢弃来自 WAN 的 ICMP 时间戳/掩码查询 | `drop` 生成该条，`accept` 不生成 |
-
-`single_mac`、`spoof_hostname`、`log_drop` 目前只是配置文件里的保留字段，**规则段不读取**：单出口 MAC 由 WAN 区 `masq` 天然实现（所有终端共用 eth0 的 MAC），DHCP 指纹由 `/etc/config/dhcp` 里统一的 option 60/61 处理。
-
-### 开 / 关 / 查看
-
-```sh
-ruijie-guard show                    # 只打印将写入的规则，不改任何文件（先看再动）
-ruijie-guard status                  # enabled=... + 规则段是否存在
-
-# 开启
-uci set ruijie-guard.globals.enabled='1'
-uci commit ruijie-guard
-ruijie-guard apply                   # 写规则段 + reload 防火墙
-
-# 关闭（完整回滚）
-uci set ruijie-guard.globals.enabled='0'
-uci commit ruijie-guard
-ruijie-guard clear                   # 删规则段 + reload
-```
-
-`apply` 先删旧段再写新段，反复执行不会叠加；`clear` 只删标记段，不动你在 `/etc/firewall.user` 里自己写的规则。
-
-```sh
-sed -n '/^# BEGIN ruijie-guard/,/^# END ruijie-guard/p' /etc/firewall.user
-```
-
-生效验证：
-
-```sh
-ruijie-guard status
-nft list chain inet fw4 mangle_forward 2>/dev/null | grep ttl
-nft list chain inet fw4 forward 2>/dev/null | grep -E '1900|5353|68'
-```
-
-### 后果与风险（务必读完）
-
-- **TTL 钳制**改掉所有经 WAN 外发的 IPv4 报文 TTL：`traceroute`/`mtr` 结果失真，个别按 TTL 判路径的服务异常。排查网络问题时先 `ruijie-guard clear`。
-- **`block_leak` 只作用在转发链（forward）**，路由器自己发的 DHCP 不受影响；但 LAN 侧 DHCP 中继、跨 WAN 的 mDNS/DLNA 会被这条打断。
-- 规则里的出口网卡名写死为 **`eth0`**。若 `portmap resolve` 显示 WAN 不是 `eth0`，规则不命中——要么把 WAN 挪回 `eth0`，要么改 `/etc/firewall.user` 里的接口名（同时改 `/usr/sbin/ruijie-guard`，否则下次 `apply` 会覆盖）。
-- **合规风险**：这些能力可能违反网络使用协议，先读 [compliance.md](compliance.md)。网络提供方明确禁止共享接入时不要开。
+| 认证一直重试 | 账号/密码错或服务未开 | 用官方客户端先验证账号 |
+| 认证成功但没有 IP | WAN 的 `auto` 为 0 | `uci set network.wan.auto=1; uci commit network; ifup wan` |
+| 认证成功也拿到 IP，但上不了网 | 需要二次认证或 Portal | 按 [ruijie.md](ruijie.md) 处理 |
+| 日志里看不到任何输出 | init 脚本因账号为空跳过 | 填好 `username` 后 `restart` |
 
 ## 3. swap（`swapctl`）
 
@@ -192,7 +152,7 @@ docker info 2>/dev/null | grep -i 'docker root dir'
 
 | 层级 | 手段 | 影响范围 |
 |---|---|---|
-| 配置回滚 | `sysupgrade -r` 恢复备份 / `wanmode apply` / `ruijie-guard clear` | 只动配置，几秒生效 |
+| 配置回滚 | `sysupgrade -r` 恢复备份 / 改回 `/etc/minieap.conf` | 只动配置，几秒生效 |
 | 固件回滚 | 重刷上一版 `*ext4-combined-efi.img.gz` | 整盘覆盖，**数据全丢** |
 | 救砖 | Live U 盘挂根分区改配置 | 只改文件，不重刷 |
 
@@ -207,10 +167,8 @@ sysupgrade -r /tmp/cfg-2026-11-02.tar.gz          # 恢复
 单项回滚：
 
 ```sh
-ruijie-guard clear                        # 删防检测规则段
-wanmode apply home                        # WAN 回 DHCP
+uci set network.wan.proto='dhcp'; uci commit network; ifup wan
 swapctl resize 2048                       # swap 调小
-uci set ruijie-guard.globals.enabled='0'; uci commit ruijie-guard
 ```
 
 ### 5.3 固件回滚（保留旧镜像）
@@ -259,8 +217,8 @@ uci commit nikki
 logread -e minieap -f               # 认证日志
 logread -e wandetect                # 探测日志（同时写 /var/log/wandetect.log）
 logread -e firewall                 # fw4 reload 报错
-/etc/init.d/network reload           # 改完 network / wanprofile 后
-/etc/init.d/firewall reload          # 改完防火墙 / ruijie-guard 后
+/etc/init.d/network reload           # 改完 network 后
+/etc/init.d/firewall reload          # 改完防火墙后
 /etc/init.d/wandetect restart        # 探测服务（procd 托管）
 uptime; free -m; df -h               # 资源三连
 sensors 2>/dev/null | head -20       # 温度（lm-sensors）

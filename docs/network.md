@@ -20,39 +20,39 @@ for i in eth0 eth1 eth2 eth3; do
 done
 ```
 
-看当前解析结果（不改配置）：
+## 2. 端口顺序如何固定
+
+开机时 `/etc/init.d/portmap`（`START=15`，早于 network）按 **PCI 槽位升序**把物理口重命名为 `eth0`–`eth3`：
+
+- 两阶段改名（先改临时名再改目标名），避免 `eth0→eth1` 时目标名被占用；
+- 只改名字，不改任何 UCI；`/etc/config/network` 静态引用 `eth0`（WAN）与 `eth1`–`eth3`（`br-lan`）；
+- 改名失败只写日志，不阻断启动。
+
+查看当前顺序：
 
 ```sh
-portmap resolve                 # 输出形如：wan=eth0 lan=eth1 eth2 eth3
-portmap apply --dry-run         # 只打印将要写入的映射
+ip -o link show | grep eth
+for i in eth0 eth1 eth2 eth3; do
+  printf '%s  %s  ' "$i" "$(cat /sys/class/net/$i/address)"
+  ethtool "$i" 2>/dev/null | sed -n 's/.*Link detected: /link=/p'
+done
 ```
 
-## 2. 把端口角色钉死（按 MAC 或 PCI 槽位）
-
-`/etc/config/portmap` 是「物理口 → 角色」的映射表。首次开机由 `portmap apply` 解析成真实 `ethX` 写进 `/etc/config/network`（`network.wan.device`、`br-lan` 的 `ports`），之后全部是标准 UCI，可以在 LuCI 里改。
-
-填 MAC 最稳（MAC 跟着网卡走，换 PCI 槽位也不变）：
+**如果顺序和机壳丝印不一致**（PCI 顺序不等于面板顺序），按 MAC 改写引用即可：
 
 ```sh
-# 1) 抄下四个口的 MAC
+# 1) 抄下每个物理口的 MAC
 for i in eth0 eth1 eth2 eth3; do echo "$i $(cat /sys/class/net/$i/address)"; done
 
-# 2) 写进 portmap（把值换成你机器的）
-uci set portmap.wan.macaddr='00:1b:21:aa:00:04'
-uci set portmap.lan1.macaddr='00:1b:21:aa:00:01'
-uci set portmap.lan2.macaddr='00:1b:21:aa:00:02'
-uci set portmap.lan3.macaddr='00:1b:21:aa:00:03'
-uci commit portmap
-
-# 3) 重新解析并写入 network，然后让网络配置生效
-portmap resolve                 # 先看对不对
-portmap apply
-ubus call network reload        # portmap 不会自己 reload，必须手动一次
+# 2) 把 WAN 指到真正面向上级的那个口的 MAC 对应的名字
+uci set network.wan.device='eth2'
+uci set network.wan6.device='eth2'
+uci set network.wan_dev.name='eth2'
+uci commit network
+ifup wan
 ```
 
-也可以用 PCI 槽位（`option pci_slot '0000:01:00.0'`，值见 `/sys/class/net/ethX/device/uevent` 的 `PCI_SLOT_NAME`）。匹配优先级：`macaddr` > `pci_slot` > 物理顺序兜底。
-
-> `portmap apply` 只 `uci commit network`，不会重启网络。漏了 `ubus call network reload` 会表现为「配置改了但一点变化都没有」。
+改名只在开机执行一次；手工调整后重启仍然有效，因为名字是按槽位稳定生成的。
 
 ## 3. 内网地址与 DHCP
 
@@ -161,23 +161,13 @@ cat /etc/config/custom_router_ip.txt
 
 | 场景 | 操作 |
 |---|---|
-| 锐捷认证 | `wanmode apply ruijie`，见 [ruijie.md](ruijie.md) |
-| 家里 DHCP（光猫拨号） | `wanmode apply home`（`home` 出厂是 `proto dhcp`） |
-| 家里 PPPoE（自己拨号） | 先改 `home` 的实现方式再应用：见下面 |
-| 临时/酒店 | `wanmode apply adhoc`，再按酒店要求做 Portal 登录 |
-
-把 `home` 改成 PPPoE：
-
-```sh
-wanmode set home proto 'pppoe'
-wanmode set home username '宽带账号'
-wanmode set home password '宽带密码'
-wanmode apply home
-```
+| 锐捷认证 | 编辑 `/etc/minieap.conf` 填账号，`/etc/init.d/minieap restart` |
+| 家里 DHCP（光猫拨号） | WAN 保持 `proto dhcp`，直接 `ifup wan` |
+| PPPoE 宽带 | `uci set network.wan.proto='pppoe'; uci set network.wan.username='账号'; uci set network.wan.password='密码'; uci commit network; ifup wan` |
+| 临时/酒店 | WAN `proto dhcp`，按酒店要求做 Portal 登录 |
 
 切完统一验证：
 
 ```sh
 ifstatus wan | grep -E '"up"|address|proto'
-wanmode show
 ```

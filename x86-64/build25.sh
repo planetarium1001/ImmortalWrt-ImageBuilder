@@ -8,8 +8,8 @@ echo "Starting 99-custom.sh at $(date)" >> $LOGFILE
 echo "编译固件大小为: $PROFILE MB"
 echo "Include Docker: $INCLUDE_DOCKER"
 
-# 拨号不再走构建期参数：站点 profile（/etc/config/wanprofile + wanmode）在设备上切换，
-# 构建期写死的账号既不能换网也不能撤销，属于死配置，已删除。
+# 拨号与认证都不在构建期配置：认证走设备上的 /etc/minieap.conf，
+# 宽带账号走 WAN 接口的 UCI；构建期写死的账号既不能换网也不能撤销。
 mkdir -p /home/build/immortalwrt/files/etc/config
 
 if [ -z "$CUSTOM_PACKAGES" ]; then
@@ -61,7 +61,9 @@ PACKAGES="$PACKAGES minieap luci-proto-minieap luci-i18n-minieap-zh-cn luci-comp
 PACKAGES="$PACKAGES kmod-tun kmod-inet-diag kmod-nft-tproxy kmod-nft-socket kmod-br-netfilter kmod-nf-nathelper-extra kmod-tcp-bbr"
 PACKAGES="$PACKAGES ip-full ethtool-full irqbalance conntrack"
 # 首启扩容依赖：feed 里没有 growpart，用 parted/sfdisk + resize2fs
-PACKAGES="$PACKAGES parted sfdisk e2fsprogs fdisk"
+# 25.12 把 e2fsprogs 拆成多个包：resize2fs / dumpe2fs / partx-utils 必须单独声明，
+# 否则扩容时"分区扩了、文件系统没扩"，表现为容量不变。
+PACKAGES="$PACKAGES parted sfdisk e2fsprogs fdisk resize2fs dumpe2fs partx-utils blockdev"
 # 内存压缩 swap
 PACKAGES="$PACKAGES zram-swap kmod-zram"
 # 防检测/探测依赖

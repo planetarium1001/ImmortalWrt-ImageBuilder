@@ -20,8 +20,8 @@ else
 fi
 
 # 2. 首启脚本里的 growpart/resize2fs 必须只针对根分区变量
-if grep -q 'resize2fs "\$root_dev"' "$ROOT/files/etc/uci-defaults/99-custom.sh"; then
-	echo "ok: resize2fs 仅作用于根分区"
+if grep -q 'resize2fs "/dev/\$devname"' "$ROOT/files/usr/sbin/rootfs-expand"; then
+	echo "ok: resize2fs 仅作用于反查到的分区"
 else
 	echo "FAIL: resize2fs 目标不明确"; FAIL=1
 fi

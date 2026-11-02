@@ -2,7 +2,7 @@
 # ac-14：文档覆盖刷写、回滚、AP 配置、profile 切换与合规提示
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-D="$ROOT/x86-64/docs/n5105"
+D="$ROOT/docs"
 FAIL=0
 
 if [ ! -d "$D" ]; then
@@ -25,8 +25,8 @@ need ruijie.md "minieap" "minieap 配置"
 need ruijie.md "rjv3" "锐捷 v3 模块"
 need network.md "masq6\|NAT66" "NAT66 说明"
 need network.md "AP" "AP 模式说明"
-need ops.md "wanmode" "profile 切换"
-need ops.md "ruijie-guard" "防检测开关"
+need ops.md "minieap.conf" "认证配置说明"
+need ops.md "init.d/minieap" "开机自启说明"
 need ops.md "swapctl" "swap 调整"
 need ops.md "回滚" "回滚步骤"
 need compliance.md "责任\|条款" "合规声明"

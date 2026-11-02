@@ -22,7 +22,7 @@
 | 值 | 含义 | 什么时候用 |
 |---|---|---|
 | `0` | 不使用 DHCP | 接入方要求静态 IP，或地址由别的方式下发 |
-| `1` | 二次认证 | 认证后服务器还要再走一次认证交互（固件 profile 的出厂值） |
+| `1` | 二次认证 | 认证后服务器还要再走一次认证交互 |
 | `2` | 认证后 DHCP | 最常见：认证通过后才拿到地址 |
 | `3` | 认证前 DHCP | 先拿地址再认证（部分网络） |
 
@@ -38,45 +38,28 @@ tcpdump -i eth0 -n -e -c 50 'udp port 67 or udp port 68 or ether proto 0x888e'
 - 认证后交换机还要求再认证一轮 → 用 `1`。
 - 锐捷认证网络根本不发 DHCP（自己填静态地址）→ 用 `0`。
 
-出厂 profile 给的是 `1`，多数网络要改成 `2` 或 `3`，按上面的现象挑一个，不对再换下一个。
+出厂设的是 `0`（不做 DHCP，交给 WAN 的 dhcp 客户端）。需要客户端自己取地址时改 `2`，二次认证改 `1`。
 
 ## 2. 配置账号
 
-```sh
-# 1) 写进 profile（只改配置文件，不动 WAN）
-wanmode set ruijie username '20230001'
-wanmode set ruijie password 'p@ss w0rd'
-wanmode set ruijie dhcp_type '2'
+唯一入口是 `/etc/minieap.conf`，与程序自带格式一致：
 
-# 2) 应用到 WAN
-wanmode apply ruijie
-
-# 3) 确认写进了 network
-uci show network.wan
+```ini
+username=20230001
+password=你的密码
+nic=eth0
+module=rjv3
 ```
 
-`wanmode apply` 会把 `proto` / `username` / `password` / `module` / `dhcp_type` / `auto=1` 写进 `network.wan`。`stage_timeout` 这类附加选项它不搬，需要单独设：
+保存后重载：
 
 ```sh
-uci set network.wan.stage_timeout='0'
-uci set network.wan.max_retries='0'
-uci set network.wan.log_file='/var/log/minieap.log'
-uci commit network
-ubus call network reload
+/etc/init.d/minieap restart
+logread -e minieap -f
 ```
 
-确认 `module` 是列表形式（协议处理器按数组读它，写成普通 `option` 有可能不生效）：
+需要调整高级参数时，取消对应行注释即可（`stage-timeout`、`max-retries`、`wait-after-fail`、`log-file` 等），不需要碰 UCI。
 
-```sh
-uci show network.wan.module        # 期望：network.wan.module='rjv3'（list）
-# 如果是 option 而不是 list，改一下：
-uci -q delete network.wan.module
-uci add_list network.wan.module='rjv3'
-uci commit network
-ubus call network reload
-```
-
-LuCI 等价操作：**网络 → 接口 → WAN → 编辑 → 协议选「MiniEAP client」**，填用户名 / 密码 / 插件（rjv3）/ DHCP 类型。
 
 ## 3. 前台手工试一次（最快定位问题）
 
@@ -107,9 +90,9 @@ ps w | grep -c '[m]inieap'                   # 进程数量（应为 1）
 
 | # | 现象 | 原因 | 处理 |
 |---|---|---|---|
-| 1 | `ifstatus wan` 报 `MISSING_USER_OR_PASS` | 账号或密码为空 | 重跑第 2 节的 `wanmode set` + `apply`，`uci show network.wan` 复查 |
+| 1 | `ifstatus wan` 报 `MISSING_USER_OR_PASS` | 账号或密码为空 | 按第 2 节检查 `/etc/minieap.conf` 的 `username`/`password`，然后 `restart` |
 | 2 | minieap 起来几秒就退出 | `stage_timeout` / `max_retries` 用了默认值 | 都设成 `0`（见第 2 节末尾） |
-| 3 | 日志里 EAP 一直没回应 | 网线插错口 / 该口不是锐捷认证网络口 | `portmap resolve` 确认 WAN 是哪个 `ethX`；换口再试 |
+| 3 | 日志里 EAP 一直没回应 | 网线插错口 / 该口不是锐捷认证网络口 | `ip -o link show | grep eth` 确认 WAN 对应哪个 `ethX`；换口再试 |
 | 4 | 认证通过但 `eth0` 没地址 | `dhcp_type` 不对 | 按第 1 节改 `2`/`3`/`0` 逐个试 |
 | 5 | 服务器提示「非指定客户端」/ 版本不符 | 接入方有客户端校验 | 依次试 `uci set network.wan.version_str='...'`、`service`、`fake_serial`、`rj_option`（见第 6 节） |
 | 6 | 认证报文发不出去，抓包看不到 `0x888e` | 组播地址不匹配 | `uci set network.wan.eap_bcast_addr='1'`，reload 后再试 |

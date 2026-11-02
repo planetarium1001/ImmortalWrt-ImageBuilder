@@ -12,7 +12,7 @@ need "wukongdaily/AutoBuildImmortalWrt" "上游仓库链接"
 need "README.upstream.md" "上游 README 链接"
 need "ImmortalWrt" "ImmortalWrt 来源说明"
 need "与 ImmortalWrt 官方无关" "责任边界声明"
-need "x86-64/docs/n5105/" "文档索引"
+need "docs/" "文档索引"
 need "内置软件" "内置软件章节"
 need "packages.md" "内置软件文档链接"
 need "GPL-2.0" "许可声明"
@@ -27,7 +27,7 @@ done
 
 # 索引里的文档必须真实存在
 for f in install ruijie network ops compliance packages README; do
-	[ -s "$ROOT/x86-64/docs/n5105/$f.md" ] || { echo "FAIL: 文档缺失 $f.md"; FAIL=1; }
+	[ -s "$ROOT/docs/$f.md" ] || { echo "FAIL: 文档缺失 $f.md"; FAIL=1; }
 done
 echo "ok: 文档索引指向的文件均存在"
 

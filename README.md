@@ -20,9 +20,8 @@
 | 端口 | 按 MAC / PCI 槽位固定角色，不依赖内核枚举顺序 |
 | 认证 | 内置 minieap（锐捷 v3），WAN 多探针投票后按需触发 |
 | IPv6 | ULA 前缀 + `masq6`（NAT66），终端地址对上级网络不可见 |
-| 防护 | `ruijie-guard` 规则集，可整体启用 / 撤销 |
 | 代理 | nikki（mihomo）走上游 apk 源，白名单透明代理 |
-| 迁移 | 多站点 profile 一键切换（认证网络 / 家用 / 临时） |
+| 认证 | 单一配置 `/etc/minieap.conf` + `/etc/init.d/minieap` 开机自启 |
 | 运维 | 参数文件与开关均可在 LuCI 内修改，无需重刷 |
 
 ## 快速开始
@@ -35,9 +34,34 @@
    - `profile`：`2G`（首启自动扩满整盘）
    - `include_docker`：按需
    - `enable_store`：按需
-   - 拨号不在构建期配置：锐捷认证与家用 PPPoE 均由设备上的站点 profile 切换（见[运维手册](x86-64/docs/n5105/ops.md)）
+   - 认证与拨号都不在构建期配置：认证改 `/etc/minieap.conf`，宽带账号改 WAN 的 UCI（见[运维手册](docs/ops.md)）
 4. 从 Release 下载 `immortalwrt-25.12.2-n5105-x86-64-generic-ext4-combined-efi.img.gz`（机型标识在前缀，`ext4-combined-efi` 在尾部）。
-5. 按 [安装手册](x86-64/docs/n5105/install.md) 刷写并进入后台。
+5. 按 [安装手册](docs/install.md) 刷写并进入后台。
+
+## 构建产物与磁盘布局
+
+每次构建产出两个镜像，按需选一个刷写：
+
+| 产物 | 根文件系统 | 可写空间在哪 | 适用场景 |
+|---|---|---|---|
+| `*-ext4-combined-efi.img.gz` | ext4（整盘可写） | 根分区本身 | 推荐，需要自由安装软件、改系统文件 |
+| `*-squashfs-combined-efi.img.gz` | squashfs（只读）+ overlay | `/overlay` 分区 | 需要恢复出厂能力，系统文件不会被改坏 |
+
+两者分区布局相同（引导分区 + 根分区），区别只在根分区的文件系统类型。
+
+### `/` 与 `/overlay` 的关系
+
+- **ext4 镜像**：`/` 就是根分区，没有独立的 `/overlay`。扩容扩的是 `/`，`df -h /` 即整盘可用空间。
+- **squashfs 镜像**：`/` 是只读 squashfs 底层，所有写入落到 `/overlay` 分区，由 overlayfs 合并呈现；`df -h /` 显示的其实是 `/overlay` 的容量。
+
+因此：
+
+- ext4 镜像 → 扩 `/`，扩完 `/` 就是整盘；
+- squashfs 镜像 → 扩 `/overlay`；`/` 只读且 squashfs 不支持在线扩容，不需要、也无法扩。
+
+**扩 `/overlay` 不会让 `/` 不够用。** squashfs 的 `/` 是固定大小的只读基础层，安装的软件与改动全部写入 `/overlay`；判断空间够不够看 `df -h /` 即可。
+
+首启脚本对两种镜像都处理：分别检查 `/` 与 `/overlay`，只扩可写的那一个，日志在 `/etc/config/rootfs-expand.log`。
 
 ## 写入后开机
 
@@ -56,7 +80,7 @@
 - **先接 LAN、后接 WAN**：首次启动只插 `eth1`（接 AP 或电脑），配好认证参数后再把上级网线插入 `eth0`。
 - **首次登录立即改密码**：出厂无密码，`passwd` 设置后再接入网络。
 - **上级设备关闭 DHCP**：AP 需工作在 AP / 桥接模式，否则两个 DHCP 抢答，表现为能连 WiFi 但无法上网。
-- **管理网段可能撞段**：`192.168.100.0/24` 与部分光猫维护地址重叠；撞段时按[安装手册](x86-64/docs/n5105/install.md)手工改址。
+- **管理网段可能撞段**：`192.168.100.0/24` 与部分光猫维护地址重叠；撞段时按[安装手册](docs/install.md)手工改址。
 - **刷写不可逆**：写入会清空目标盘全部分区，刷前确认盘符并备份数据。
 - **请勿接入其余设备**：首次开机的扩容为程序自己判断，不建议接入不必要的硬盘、存储设备等，以免造成错误的格式化和数据损坏。
 - **扩容期间勿断电**：首次开机扩容未完成即断电，根分区会停在镜像大小，需按文档手工 `resize2fs`。
@@ -64,7 +88,7 @@
 
 ## 内置软件
 
-在 ImmortalWrt 官方源基础上追加，完整清单与上游链接见[内置软件说明](x86-64/docs/n5105/packages.md)。
+在 ImmortalWrt 官方源基础上追加，完整清单与上游链接见[内置软件说明](docs/packages.md)。
 
 - 认证：minieap（锐捷 v3）+ LuCI 协议页
 - 代理：nikki（mihomo 内核），走 nikki 自有 apk 源
@@ -74,17 +98,17 @@
 - 网络：BBR、FullCone NAT、nft-tproxy/tun 内核模块、ip-full、ethtool-full、irqbalance
 - 调试：htop、iftop、tcpdump、iperf3、bind-dig、lm-sensors、smartmontools、nvme-cli
 - 存储与分区：parted、sfdisk、e2fsprogs、zram-swap
-- 拨号：ppp / ppp-mod-pppoe（由站点 profile 启用）
+- 拨号：ppp / ppp-mod-pppoe（改 WAN 接口协议启用）
 
 ## 文档
 
-- [安装与首次启动](x86-64/docs/n5105/install.md)：写盘、首启动作、进入后台
-- [锐捷认证](x86-64/docs/n5105/ruijie.md)：minieap 配置与排障
-- [网络与端口](x86-64/docs/n5105/network.md)：端口角色、AP 模式、NAT66
-- [内置软件](x86-64/docs/n5105/packages.md)：追加的软件、用途与上游链接
-- [日常运维](x86-64/docs/n5105/ops.md)：profile、防护开关、swap、docker、回滚
-- [使用条款与责任](x86-64/docs/n5105/compliance.md)：合规边界
-- [仓库说明](x86-64/docs/n5105/README.md)：手册总览
+- [安装与首次启动](docs/install.md)：写盘、首启动作、进入后台
+- [锐捷认证](docs/ruijie.md)：minieap 配置与排障
+- [网络与端口](docs/network.md)：端口角色、AP 模式、NAT66
+- [内置软件](docs/packages.md)：追加的软件、用途与上游链接
+- [日常运维](docs/ops.md)：认证与地址、swap、docker、回滚
+- [使用条款与责任](docs/compliance.md)：合规边界
+- [仓库说明](docs/README.md)：手册总览
 
 ## 目录结构
 
@@ -100,4 +124,4 @@
 
 ## 免责
 
-固件按现状提供，不附带担保。刷写不可逆；网络使用须遵守所接入网络的使用条款，账号与使用责任在持有人。详见[合规说明](x86-64/docs/n5105/compliance.md)。
+固件按现状提供，不附带担保。刷写不可逆；网络使用须遵守所接入网络的使用条款，账号与使用责任在持有人。详见[合规说明](docs/compliance.md)。

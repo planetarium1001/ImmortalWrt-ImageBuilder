@@ -94,7 +94,7 @@ sync
 | 步骤 | 说明 |
 |---|---|
 | 扩根分区 | `parted resizepart` + `resize2fs`，只动根分区（feed 里没有 `growpart`，所以走 parted/sfdisk） |
-| 端口角色 | `portmap apply`：按 MAC / PCI 槽位把 `eth0` 定为 WAN、其余进 `br-lan` |
+| 端口角色 | `/etc/init.d/portmap boot`：按 PCI 槽位顺序重命名为 `eth0`–`eth3` |
 | 管理地址 | 写 `network.lan.ipaddr`（构建时填的 `custom_router_ip`，默认 `192.168.100.1`） |
 | WAN 关闭 | `wan.auto=0`、`wan6.auto=0`，避免无网阶段乱发包 |
 | 主机名/时间 | `n5105-router` + 安卓 TV 时间服务器映射 |
@@ -133,7 +133,7 @@ apk --version                       # 25.12 用 apk 管包，不是 opkg
 
 1. 先只接 LAN，进后台、设密码、配好认证账号（[ruijie.md](ruijie.md)）。
 2. 再把锐捷认证网络网线插 **eth0**。
-3. `wanmode apply ruijie`（或 LuCI 里把 WAN 协议设为 minieap）。
+3. 编辑 `/etc/minieap.conf` 填账号密码，然后 `/etc/init.d/minieap restart`。
 
 WAN 出厂是 `proto none` + `auto 0`：**插上网线也不会自己发包**，所以不会因为「先插了认证网络」而失联。
 
@@ -179,7 +179,7 @@ df -h /                      # 应该接近 14G
 ## 9. 首次登录检查清单
 
 ```sh
-portmap resolve                     # wan=eth0 lan=eth1 eth2 eth3
+ip -o link show | grep eth          # 看端口顺序
 ip -br addr show                    # br-lan 是否 192.168.100.1/24
 uci show network.wan.proto          # 应为 none（还没配认证）
 uci show network.lan.ipaddr

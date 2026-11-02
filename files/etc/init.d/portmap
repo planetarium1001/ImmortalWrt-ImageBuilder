@@ -1,0 +1,42 @@
+#!/bin/sh /etc/rc.common
+# 开机把物理网口按 PCI 槽位顺序重命名为 eth0..ethN。
+# START=15：早于 network(20)，此时接口都还没 up。
+# 为什么按 PCI 槽位：内核枚举顺序在大版本升级或换槽后会变，槽位相对稳定。
+# 失败只记日志，不阻断启动——宁可名字不对，也不能开机失败。
+
+START=15
+
+list_ports() {
+	# 输出 "槽位 接口名"，按槽位升序
+	for d in /sys/class/net/*; do
+		[ -e "$d/device" ] || continue
+		n=$(basename "$d")
+		case "$n" in eth*|en*|tmp*) ;; *) continue ;; esac
+		slot=$(sed -n 's/^PCI_SLOT_NAME=//p' "$d/device/uevent" 2>/dev/null | head -n1)
+		[ -n "$slot" ] || slot="zz-$n"
+		echo "$slot $n"
+	done | sort
+}
+
+boot() {
+	ports=$(list_ports)
+	[ -n "$ports" ] || { logger -t portmap "未发现物理网口"; return 0; }
+
+	# 第一阶段：全部改成临时名，避免 eth0→eth1 时目标名被占用
+	i=0
+	for line in $ports; do
+		name=${line#* }
+		ip link set "$name" down 2>/dev/null
+		ip link set "$name" name "tmp$i" 2>/dev/null || logger -t portmap "改名失败 $name -> tmp$i"
+		i=$((i+1))
+	done
+
+	# 第二阶段：临时名按顺序改成 eth0..ethN
+	i=0
+	for line in $ports; do
+		ip link set "tmp$i" name "eth$i" 2>/dev/null || logger -t portmap "改名失败 tmp$i -> eth$i"
+		i=$((i+1))
+	done
+
+	logger -t portmap "端口顺序已固定：$(ip -o link show 2>/dev/null | awk -F': ' '/eth/{printf "%s ", $2}')"
+}

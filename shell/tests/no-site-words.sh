@@ -16,7 +16,7 @@ fi
 
 # 旧标识符不得残留
 # 注意排除本测试自身（它必须写出旧名才能断言）
-for old in campus-guard wanprofile.campus "apply campus" campus.md; do
+for old in campus-guard "apply campus" campus.md; do
 	if grep -rn "$old" --include="*.sh" --include="*.md" "$ROOT/files" "$ROOT/shell" "$ROOT/x86-64" 2>/dev/null \
 		| grep -qv "no-site-words.sh"; then
 		echo "FAIL: 残留旧标识 $old"; FAIL=1

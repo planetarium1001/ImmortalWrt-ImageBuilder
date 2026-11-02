@@ -4,9 +4,9 @@ set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 FAIL=0
 
-for f in "$ROOT/x86-64/build25.sh" "$ROOT/files/usr/sbin/portmap" "$ROOT/files/usr/sbin/wandetect" \
-         "$ROOT/files/usr/sbin/swapctl" "$ROOT/files/usr/sbin/wanmode" "$ROOT/files/usr/sbin/ruijie-guard" \
-         "$ROOT/files/etc/uci-defaults/99-custom.sh" "$ROOT/files/etc/init.d/wandetect"; do
+for f in "$ROOT/x86-64/build25.sh" "$ROOT/files/usr/sbin/wandetect" \
+         "$ROOT/files/usr/sbin/swapctl" "$ROOT/files/usr/sbin/rootfs-expand" \
+         "$ROOT/files/etc/uci-defaults/99-custom.sh" "$ROOT/files/etc/init.d/wandetect" "$ROOT/files/etc/init.d/minieap" "$ROOT/files/etc/init.d/portmap"; do
 	if sh -n "$f" 2>/dev/null; then echo "ok: syntax $f"; else echo "FAIL: syntax $f"; FAIL=1; fi
 done
 

@@ -41,7 +41,7 @@ case "$a" in
 	*) echo "FAIL: WAN 未保持关闭"; FAIL=1 ;;
 esac
 case "$a" in
-	*n5105-router*) echo "ok: hostname 写入" ;;
+	*ImmortalWrt*) echo "ok: hostname 写入" ;;
 	*) echo "FAIL: hostname 未写入"; FAIL=1 ;;
 esac
 

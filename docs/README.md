@@ -1,0 +1,74 @@
+# N5105 v5 四网口路由固件手册
+
+- 适用设备：N5105 v5（Jasper Lake，4×i226-V 2.5G），UEFI 物理直装
+- 系统盘：任意容量的 M.2 NVMe（首启自动扩满）
+- 固件：ImmortalWrt 25.12.2（apk，Linux 6.12）定制构建
+
+## 这套固件提供什么
+
+- **认证**：minieap（锐捷 v3），配置文件 `/etc/minieap.conf`，开机自启 `/etc/init.d/minieap`
+- **地址**：WAN 用原生 `proto dhcp`；IPv6 由网络侧决定，内网终端走 ULA + NAT66
+- **端口**：开机按 PCI 槽位顺序固定为 `eth0`–`eth3`，与内核枚举顺序无关
+- **探测**：`/usr/sbin/wandetect` 多探针投票，判定 WAN 是否可用（默认不启用）
+- **代理**：nikki（mihomo）白名单模式，出厂关闭
+- **容器**：dockerd + dockerman，构建时 `include_docker=yes` 才包含
+- **运维**：LuCI 自定义命令、在线文件编辑、网页终端
+
+## 五分钟上手
+
+1. **刷写**：写入系统盘，见 [install.md](install.md)
+2. **进后台**：`eth1` 接 AP 或电脑，浏览器打开 `http://192.168.100.1`，用户 `root`，出厂无密码
+3. **配认证**：编辑 `/etc/minieap.conf` 填账号密码，见 [ruijie.md](ruijie.md)
+4. **接上级网络**：网线插 `eth0`，`/etc/init.d/minieap restart`，`ifstatus wan` 看到地址即通
+
+## 文档目录
+
+| 文档 | 内容 |
+|---|---|
+| [install.md](install.md) | 刷写、首次启动、进入后台、扩容 |
+| [ruijie.md](ruijie.md) | minieap 配置与认证排障 |
+| [network.md](network.md) | 端口顺序、AP 模式、NAT66、网段 |
+| [ops.md](ops.md) | 认证与地址、swap、数据盘与 docker、备份回滚 |
+| [packages.md](packages.md) | 内置软件清单与上游链接 |
+| [compliance.md](compliance.md) | 使用条款与责任声明 |
+
+## 常用命令
+
+```sh
+# 认证
+vi /etc/minieap.conf                # 唯一配置入口
+/etc/init.d/minieap restart         # 重载认证
+logread -e minieap -f               # 实时日志
+/usr/sbin/minieap -u 账号 -p 密码 -n eth0 --module rjv3   # 手工试跑
+
+# 地址
+ifstatus wan                        # WAN 是否拿到地址
+ifup wan                            # 手动拉起 WAN
+
+# 端口
+ip -o link show | grep eth          # 看当前顺序
+/etc/init.d/portmap boot            # 重新按 PCI 顺序固定（会短暂断网）
+
+# 扩容
+/usr/sbin/rootfs-expand --dry-run   # 只看判定，不动手
+/usr/sbin/rootfs-expand --verbose   # 执行并打印
+cat /etc/config/rootfs-expand.log   # 历史记录
+
+# 检测
+/usr/sbin/wandetect run             # 跑一轮探测
+/usr/sbin/wandetect status          # 最近一次结果
+
+# swap
+/usr/sbin/swapctl status
+/usr/sbin/swapctl resize 2048
+```
+
+## 文件位置
+
+| 路径 | 作用 |
+|---|---|
+| `/etc/minieap.conf` | 认证配置（唯一入口） |
+| `/etc/config/network` | 接口与端口引用 |
+| `/etc/config/rootfs-expand.log` | 扩容日志 |
+| `/etc/config/uci-defaults-log.txt` | 首启脚本日志 |
+| `/var/log/minieap.log` | minieap 自身日志 |
