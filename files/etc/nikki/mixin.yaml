@@ -1,0 +1,100 @@
+# nikki Profile Mixin（白名单透明代理）
+#
+# 合并规则先说清楚，否则下面每一条都没法理解（依据 nikki.init 里的两条 yq 命令）：
+#   1) 本文件只在 /etc/config/nikki 里 mixin.mixin_file_content=1 时才被读入
+#      （该开关已在 files/etc/config/nikki 置 1）。
+#   2) 合并顺序是「订阅 profile → 本文件 → LuCI 里的 mixin 选项」，后者覆盖前者。
+#      所以端口、监听地址、DNS 端口这类硬参数只写在 UCI 里，本文件只管"策略"。
+#   3) 带 nikki- 前缀的键是"前置插入"语义：
+#        rules        = nikki-rules        + 订阅自带 rules
+#        proxy-groups = nikki-proxy-groups + 订阅自带 proxy-groups
+#      前置意味着优先级更高，也意味着订阅更新/换订阅都不会把这几条规则冲掉——
+#      这就是必须放 mixin、不能直接改订阅文件的理由。
+#
+# 白名单语义：命中清单才走代理，其余一律直连。因此规则末尾是 MATCH,DIRECT，
+# 它前置之后订阅自带的 MATCH,PROXY 变成永远走不到的死规则——这正是我们要的效果：
+# 订阅只负责"供节点"，不负责"供策略"。
+
+mode: rule
+
+# ---------------------------------------------------------------- 代理组
+# 为什么不写 use: [provider 名]：订阅里 proxy-provider 的名字由服务商决定，
+# 写死一个名字会让 mihomo 直接启动失败（proxy provider not found）。
+# include-all-* 是按"全量引入"工作的，名字怎么换都不影响：
+#   include-all-proxies   收订阅里内联 proxies: 的节点
+#   include-all-providers 收订阅里 proxy-providers: 引入的节点
+nikki-proxy-groups:
+  - name: 白名单
+    type: select
+    include-all-proxies: true
+    include-all-providers: true
+    proxies:
+      - DIRECT # 保底项：需要临时让某个站点直连时，在 LuCI 里切一下即可
+
+# ---------------------------------------------------------------- 规则
+nikki-rules:
+  # 白名单清单本体放在 /etc/nikki/ruleset/proxy-whitelist.yaml，
+  # 用户按行加域名即可（LuCI 文件管理器可编辑），不必碰本文件。
+  # 用 RULE-SET 而不是把域名写在这里：清单会长期增删，策略文件保持不动更安全。
+  - RULE-SET,nikki-whitelist,白名单
+
+  # 内网/回环/链路本地一律直连。
+  # nikki 的 nft 规则已用 proxy.reserved_ip 兜过一层，这里再写一遍是因为
+  # 混合端口(7890)那条旁路不经过 nft，只有规则能拦住它。
+  # no-resolve：不加这个，纯 IP 规则会逼 mihomo 为每条 IP 反查域名，白白多一轮 DNS。
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
+  # 本地域名词后缀：mDNS/打印共享/路由自名，走代理没有任何意义
+  - DOMAIN-SUFFIX,lan,DIRECT
+  - DOMAIN-SUFFIX,local,DIRECT
+
+  # 兜底直连：白名单之外全部不进代理，省流量，也让校园网侧看到的外联更"正常"
+  - MATCH,DIRECT
+
+# 白名单清单（file 型 rule-provider，路径必须真实存在，否则 mihomo 起不来）
+rule-providers:
+  nikki-whitelist:
+    type: file
+    behavior: domain
+    path: /etc/nikki/ruleset/proxy-whitelist.yaml
+
+# ---------------------------------------------------------------- DNS
+# "不劫持局域网 DNS"在这里落实为三件事：
+#   1) 不监听 53。dnsmasq 继续是 LAN 唯一的 DNS，mihomo 自己的 DNS 只跑在 1053 上
+#      （端口在 /etc/config/nikki 的 dns_listen 里，UCI 覆盖本文件）。
+#      两个 DNS 抢 53 端口是 nikki 接入后最常见的故障，从源头上避免。
+#   2) 内网域名不做 fake-ip。假 IP 只对"要交给 mihomo 判路的域名"有意义；
+#      把 .lan/.local/.arpa 也伪造成 198.18.x.x，路由器自己的名字、打印机 mDNS、
+#      上级校园网的内网域名会全部解析不到——这类"莫名其妙打不开内网"最难查。
+#   3) 私有域名的解析交给国内公共 DNS 直查：代理侧 DNS 在校园网里常常不可达，
+#      直查至少拿得到结果。
+dns:
+  enable: true
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - '*.home.arpa'
+    - '+.arpa'
+    - '*.msftconnecttest.com'
+    - '*.msftncsi.com'
+    - 'time.*.com'
+    - 'ntp.*.com'
+  # 只匹配本地后缀，不写 'geosite:private'：后者依赖 geosite.dat 是否下载成功，
+  # 离线首启时匹配不到就等于没配；域名后缀是确定的，不依赖任何外部数据。
+  nameserver-policy:
+    '+.lan':
+      - '223.5.5.5'
+      - '119.29.29.29'
+    '+.local':
+      - '223.5.5.5'
+      - '119.29.29.29'
+    '+.home.arpa':
+      - '223.5.5.5'
+      - '119.29.29.29'

@@ -1,0 +1,31 @@
+# === WORKFLOW: ignore start ===
+.DS_Store
+Thumbs.db
+.venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+*.log
+.workflow-backup-*/
+# === WORKFLOW: ignore end ===
+
+# === 工作流与代理脚手架：不进仓库 ===
+# 这些是本地协作/自动化产物，跟随工具版本变化，提交后只会污染 diff。
+.workflow/
+.dsh/
+AGENTS.md
+.claude/
+.cursor/
+.vscode/
+.idea/
+
+# 子代理/单元工作区（brief、handoff、scratch）
+workspaces/
+
+# 测试与调试留下的临时物
+*.db
+*.db.tmp
+*.out
+/tmp/

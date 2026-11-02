@@ -1,0 +1,3 @@
+#!/bin/sh
+# 供 PATH 前置的 uci 桩入口
+exec sh "$(dirname "$0")/lib-uci-stub.sh" "$@"

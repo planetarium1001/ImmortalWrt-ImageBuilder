@@ -1,0 +1,87 @@
+#!/bin/sh
+# campus-guard —— 校园网防检测规则段的生成/清除
+#   campus-guard apply     写入规则段并 reload firewall
+#   campus-guard clear     删除规则段并 reload firewall
+#   campus-guard status    当前状态与规则摘要
+#   campus-guard show      仅打印将写入的规则（dry-run，便于测试）
+FW=/etc/firewall.user
+BEGIN='# BEGIN campus-guard'
+END='# END campus-guard'
+cfg() { uci -q get "campus-guard.globals.$1" 2>/dev/null; }
+
+# WAN 设备名从 network 读，避免写死 eth0
+wan_dev() {
+	d=$(uci -q get network.wan.device 2>/dev/null)
+	[ -n "$d" ] || d=eth0
+	echo "$d"
+}
+
+rules() {
+	[ "$(cfg enabled)" = "1" ] || return 0
+	dev=$(wan_dev)
+	ttl=$(cfg ttl_clamp); [ -n "$ttl" ] || ttl=64
+	# log_drop 打开时给丢弃规则加 log 前缀，便于现场确认"到底是谁在探测"
+	if [ "$(cfg log_drop)" = "1" ]; then
+		LOGPFX='log prefix "campus-guard drop: " '
+	else
+		LOGPFX=''
+	fi
+	leak=$(cfg block_leak)
+	win=$(cfg wan_input)
+
+	# fw4 兼容：使用 nft 语法，随 firewall.user include 载入
+	[ "$ttl" != "0" ] && cat <<R
+# WAN 出向统一 TTL，消除二级路由特征
+nft add rule inet fw4 mangle_forward oifname "$dev" ip ttl set $ttl
+R
+	if [ "$leak" = "1" ]; then
+		cat <<R
+# 屏蔽服务发现/地址分配类协议外泄
+nft add rule inet fw4 forward oifname "$dev" udp dport { 67, 68, 137, 138, 1900, 5353, 547 } ${LOGPFX}drop
+nft add rule inet fw4 forward oifname "$dev" ip daddr 255.255.255.255 drop
+R
+	fi
+	if [ "$win" = "drop" ]; then
+		cat <<R
+# 明确丢弃来自 WAN 的 ICMP 时间戳/掩码查询
+nft add rule inet fw4 input iifname "$dev" icmp type { timestamp-request, address-mask-request } drop
+R
+	fi
+}
+
+apply() {
+	[ "$(cfg enabled)" = "1" ] || { echo "campus-guard disabled"; [ -f "$FW" ] && sed -i "/^$BEGIN/,/^$END/d" "$FW"; return 0; }
+	touch "$FW"
+	sed -i "/^$BEGIN/,/^$END/d" "$FW"
+	{
+		echo "$BEGIN"
+		rules
+		echo "$END"
+	} >>"$FW"
+	/etc/init.d/firewall reload >/dev/null 2>&1 || fw4 reload >/dev/null 2>&1
+	echo "campus-guard applied"
+}
+
+clear() {
+	[ -f "$FW" ] && sed -i "/^$BEGIN/,/^$END/d" "$FW"
+	/etc/init.d/firewall reload >/dev/null 2>&1 || fw4 reload >/dev/null 2>&1
+	echo "campus-guard cleared"
+}
+
+status() {
+	echo "enabled=$(cfg enabled) ttl=$(cfg ttl_clamp) leak=$(cfg block_leak) wan_input=$(cfg wan_input)"
+	if [ -f "$FW" ] && grep -q "^$BEGIN" "$FW"; then
+		echo "rules: present"
+		sed -n "/^$BEGIN/,/^$END/p" "$FW" | sed '1d;$d'
+	else
+		echo "rules: absent"
+	fi
+}
+
+case "$1" in
+	apply) apply ;;
+	clear) clear ;;
+	status) status ;;
+	show) rules ;;
+	*) echo "usage: campus-guard apply|clear|status|show" >&2; exit 2 ;;
+esac

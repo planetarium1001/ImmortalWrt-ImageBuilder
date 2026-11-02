@@ -1,0 +1,119 @@
+#!/bin/sh
+# wandetect —— WAN 可用性判定（多探针投票）与 minieap 触发
+#   wandetect run            执行一轮探测并输出判定
+#   wandetect verdict --http-ok N --http-total M --icmp-ok K   纯计算，便于测试
+#   wandetect status         打印最近一次结果
+
+CONF=/etc/config/wandetect
+STATE=/var/run/wandetect.state
+LOG=/var/log/wandetect.log
+
+log() { echo "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null; }
+
+cfg() { uci -q get "wandetect.globals.$1" 2>/dev/null; }
+
+# 投票判定：成功侧宽松，失败侧严格
+verdict() {
+	ok=$1; total=$2; icmp=$3
+	q_on=$(cfg quorum_online); q_off=$(cfg quorum_offline)
+	[ -n "$q_on" ] || q_on=2
+	[ -n "$q_off" ] || q_off=0
+	if [ "$ok" -ge "$q_on" ]; then
+		echo online
+	elif [ "$ok" -le "$q_off" ] && [ "$icmp" -eq 0 ]; then
+		echo failed
+	else
+		echo degraded
+	fi
+}
+
+probe_one() {
+	url=$1; type=$2; expect=$3; iface=$4; tmo=$5
+	body=$(mktemp)
+	code=$(curl -s -o "$body" -m "$tmo" --interface "$iface" -w '%{http_code}' "$url" 2>/dev/null)
+	case "$type" in
+		204) [ "$code" = "204" ] && { rm -f "$body"; return 0; } ;;
+		content) [ "$code" = "200" ] && grep -qF "$expect" "$body" 2>/dev/null && { rm -f "$body"; return 0; } ;;
+	esac
+	rm -f "$body"
+	return 1
+}
+
+run() {
+	iface=$(cfg iface); [ -n "$iface" ] || iface=eth0
+	tmo=$(cfg timeout); [ -n "$tmo" ] || tmo=3
+	tmp=$(mktemp -d)
+
+	i=0
+	while :; do
+		[ "$(uci -q get wandetect.@probe[$i].url)" ] || break
+		en=$(uci -q get wandetect.@probe[$i].enabled)
+		if [ "$en" != "0" ]; then
+			url=$(uci -q get wandetect.@probe[$i].url)
+			type=$(uci -q get wandetect.@probe[$i].type)
+			expect=$(uci -q get wandetect.@probe[$i].expect)
+			name=$(uci -q get wandetect.@probe[$i].name)
+			( probe_one "$url" "$type" "$expect" "$iface" "$tmo" && : >"$tmp/$name.ok" || : >"$tmp/$name.fail" ) &
+		fi
+		i=$((i+1))
+	done
+	wait
+
+	ok=0; total=0
+	for f in "$tmp"/*.ok "$tmp"/*.fail; do
+		[ -e "$f" ] || continue
+		total=$((total+1))
+		case "$f" in *.ok) ok=$((ok+1)) ;; esac
+	done
+
+	icmp_ok=0
+	j=0
+	while :; do
+		h=$(uci -q get wandetect.@icmp[$j].host)
+		[ -n "$h" ] || break
+		ping -c 1 -W 2 "$h" >/dev/null 2>&1 && icmp_ok=$((icmp_ok+1))
+		j=$((j+1))
+	done
+
+	v=$(verdict "$ok" "$total" "$icmp_ok")
+	echo "$(date '+%F %T') http=$ok/$total icmp=$icmp_ok verdict=$v" >"$STATE"
+	log "http=$ok/$total icmp=$icmp_ok verdict=$v"
+	rm -rf "$tmp"
+
+	case "$v" in
+		failed)
+			if [ "$(cfg trigger_minieap)" = "1" ] && [ -x /etc/init.d/minieap ]; then
+				log "trigger minieap"
+				/etc/init.d/minieap restart >/dev/null 2>&1
+			fi
+			;;
+		degraded) log "degraded: warn only, no auth restart" ;;
+	esac
+	echo "$v"
+}
+
+CMD=$1; shift 2>/dev/null
+case "$CMD" in
+	verdict)
+		while [ $# -gt 0 ]; do
+			case "$1" in
+				--http-ok) ok=$2; shift 2 ;;
+				--http-total) total=$2; shift 2 ;;
+				--icmp-ok) icmp=$2; shift 2 ;;
+				*) shift ;;
+			esac
+		done
+		verdict "$ok" "$total" "$icmp"
+		;;
+	run) run ;;
+	loop)
+		while :; do
+			[ "$(cfg enabled)" = "0" ] && { sleep 10; continue; }
+			run >/dev/null 2>&1
+			iv=$(cfg interval); [ -n "$iv" ] || iv=30
+			sleep "$iv"
+		done
+		;;
+	status) cat "$STATE" 2>/dev/null || echo "no state" ;;
+	*) echo "usage: wandetect run|verdict|status" >&2; exit 2 ;;
+esac

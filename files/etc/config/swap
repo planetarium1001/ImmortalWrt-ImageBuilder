@@ -1,0 +1,8 @@
+# swapfile 配置：不用 swap 分区，大小可随时调整。
+config swap 'globals'
+	option enabled '1'
+	option file '/swapfile'
+	option size_mb '4096'
+	option swappiness '20'
+	option zram '1'
+	option zram_percent '50'

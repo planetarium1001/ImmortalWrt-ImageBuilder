@@ -1,0 +1,130 @@
+#!/bin/sh
+# portmap —— 把物理网口解析成角色，不依赖内核枚举顺序。
+# 用法:
+#   portmap resolve [--sysfs /sys] [--config /etc/config/portmap]
+#   portmap apply   [--sysfs /sys] [--config /etc/config/portmap] [--dry-run]
+#
+# 输出（resolve）: wan=eth0 lan=eth1 eth2 eth3
+# 匹配优先级: macaddr > pci_slot > port 序号
+
+SYSFS=/sys
+CONF=/etc/config/portmap
+DRY=0
+
+log() { logger -t portmap -- "$*" 2>/dev/null; echo "$*" >&2; }
+
+# 读取 uci: 仅依赖 shell，便于测试时用桩数据
+uci_get() {
+	uci -q get "$1" 2>/dev/null
+}
+
+list_physical() {
+	# 找出所有带 device 的物理网口，按 pci 槽位排序保证稳定
+	for d in "$SYSFS"/class/net/*; do
+		[ -e "$d/device" ] || continue
+		n=$(basename "$d")
+		case "$n" in eth*|en*) ;; *) continue ;; esac
+		slot=""
+		if [ -r "$d/device/uevent" ]; then
+			slot=$(sed -n 's/^PCI_SLOT_NAME=//p' "$d/device/uevent" | head -n1)
+		fi
+		echo "${slot:-zzzz} $n"
+	done | sort | awk '{print $2}'
+}
+
+port_mac() {
+	uci_get "portmap.$1.macaddr"
+}
+
+port_slot() {
+	uci_get "portmap.$1.pci_slot"
+}
+
+resolve() {
+	ifnames=$(list_physical)
+	if [ -z "$ifnames" ]; then
+		log "no physical interface found under $SYSFS"
+		return 1
+	fi
+
+	wan=""
+	lan=""
+	used=""
+	# 先按 macaddr，再按 pci_slot
+	for s in $(uci -q show portmap 2>/dev/null | sed -n 's/^portmap\.\([^.=]*\)=port$/\1/p'); do
+		role=$(uci_get "portmap.$s.role")
+		mac=$(port_mac "$s")
+		slot=$(port_slot "$s")
+		match=""
+		if [ -n "$mac" ]; then
+			for i in $ifnames; do
+				cur=$(cat "$SYSFS/class/net/$i/address" 2>/dev/null | tr 'A-Z' 'a-z')
+				[ "$cur" = "$(echo "$mac" | tr 'A-Z' 'a-z')" ] && match=$i && break
+			done
+		fi
+		if [ -z "$match" ] && [ -n "$slot" ]; then
+			for i in $ifnames; do
+				case " $used " in *" $i "*) continue ;; esac
+				cur=$(sed -n 's/^PCI_SLOT_NAME=//p' "$SYSFS/class/net/$i/device/uevent" 2>/dev/null | head -n1)
+				[ "$cur" = "$slot" ] && match=$i && break
+			done
+		fi
+		if [ -n "$match" ]; then
+			used="$used $match"
+			case "$role" in
+				wan) wan=$match ;;
+				lan) lan="$lan $match" ;;
+			esac
+		fi
+	done
+
+	# 未匹配的按物理顺序补位
+	for i in $ifnames; do
+		case " $used " in *" $i "*) continue ;; esac
+		if [ -z "$wan" ]; then
+			wan=$i
+			used="$used $i"
+		else
+			lan="$lan $i"
+			used="$used $i"
+		fi
+	done
+
+	[ -n "$wan" ] || wan=$(uci_get portmap.globals.fallback)
+	echo "wan=$wan lan=$(echo $lan)"
+}
+
+apply() {
+	out=$(resolve) || return 1
+	wan=$(echo "$out" | sed -n 's/.*wan=\([^ ]*\).*/\1/p')
+	lans=$(echo "$out" | sed -n 's/.*lan=//p')
+	log "resolved: wan=$wan lan=$lans"
+	if [ "$DRY" = "1" ]; then
+		echo "$out"
+		return 0
+	fi
+	uci set network.wan.device="$wan"
+	uci set network.wan6.device="$wan"
+	[ -n "$wan" ] && uci set network.wan_dev.name="$wan"
+	uci -q delete network.br_lan.ports
+	for i in $lans; do
+		uci add_list network.br_lan.ports="$i"
+	done
+	uci commit network
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--sysfs) SYSFS=$2; shift 2 ;;
+		--config) CONF=$2; shift 2 ;;
+		--dry-run) DRY=1; shift ;;
+		resolve|apply) CMD=$1; shift ;;
+		*) shift ;;
+	esac
+done
+
+case "$CMD" in
+	resolve) resolve ;;
+	apply) apply ;;
+	*) echo "usage: portmap resolve|apply [--sysfs DIR] [--dry-run]" >&2; exit 2 ;;
+esac

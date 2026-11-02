@@ -1,0 +1,60 @@
+#!/bin/sh
+# swapctl —— 管理 swapfile 与 zram
+#   swapctl apply            按 /etc/config/swap 创建并启用
+#   swapctl status           当前 swap 使用
+#   swapctl resize 8192      调整到 8192MB
+CONF=/etc/config/swap
+cfg() { uci -q get "swap.globals.$1" 2>/dev/null; }
+
+apply() {
+	[ "$(cfg enabled)" = "0" ] && { echo "swap disabled"; return 0; }
+	file=$(cfg file); [ -n "$file" ] || file=/swapfile
+	size=$(cfg size_mb); [ -n "$size" ] || size=4096
+	sw=$(cfg swappiness); [ -n "$sw" ] || sw=20
+
+	# 只写系统盘根分区；数据盘由用户自行挂载，不在这里猜路径
+	if [ ! -f "$file" ]; then
+		fallocate -l "${size}M" "$file" 2>/dev/null || dd if=/dev/zero of="$file" bs=1M count="$size" status=none
+		chmod 600 "$file"
+		mkswap "$file" >/dev/null 2>&1
+	fi
+	swapon "$file" 2>/dev/null
+
+	# zram：压缩内存当 swap 用，4G 内存的机器上比多加磁盘 swap 收益大得多
+	if [ "$(cfg zram)" = "1" ]; then
+		if [ -x /etc/init.d/zram ]; then
+			/etc/init.d/zram enable >/dev/null 2>&1
+			/etc/init.d/zram start >/dev/null 2>&1
+			echo "zram enabled"
+		else
+			echo "zram-swap 未安装，跳过（PACKAGES 里应有 zram-swap）"
+		fi
+	fi
+	echo "vm.swappiness=$sw" >/etc/sysctl.d/99-swappiness.conf
+	sysctl -p /etc/sysctl.d/99-swappiness.conf >/dev/null 2>&1
+	grep -q "^$file" /etc/fstab || echo "$file none swap sw 0 0" >>/etc/fstab
+	echo "swapfile $file ${size}MB active"
+}
+
+status() {
+	echo "== swap =="
+	cat /proc/swaps 2>/dev/null
+	free -m 2>/dev/null | sed -n '1,4p'
+}
+
+resize() {
+	new=$1
+	[ -n "$new" ] || { echo "usage: swapctl resize <MB>"; exit 2; }
+	file=$(cfg file); [ -n "$file" ] || file=/swapfile
+	swapoff "$file" 2>/dev/null
+	rm -f "$file"
+	uci set swap.globals.size_mb="$new"; uci commit swap
+	apply
+}
+
+case "$1" in
+	apply) apply ;;
+	status) status ;;
+	resize) resize "$2" ;;
+	*) echo "usage: swapctl apply|status|resize <MB>" >&2; exit 2 ;;
+esac

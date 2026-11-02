@@ -1,0 +1,10 @@
+# 白名单：只有这里列出的域名会走代理，其余全部直连。
+# 用户可以在 LuCI 文件管理里编辑本文件，然后重启 nikki 生效。
+payload:
+  - google.com
+  - github.com
+  - githubusercontent.com
+  - youtube.com
+  - googlevideo.com
+  - openai.com
+  - anthropic.com

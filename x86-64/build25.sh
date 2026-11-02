@@ -63,11 +63,41 @@ PACKAGES="$PACKAGES luci-i18n-filemanager-zh-cn"
 # 合并imm仓库以外的第三方插件 暂时注释
 PACKAGES="$PACKAGES $CUSTOM_PACKAGES"
 
+# ============= 校园网/便携路由必备组件 =============
+# 认证：minieap(锐捷 v3) + 官方 LuCI 协议页；luci-compat 是 Lua proto handler 的依赖
+PACKAGES="$PACKAGES minieap luci-proto-minieap luci-i18n-minieap-zh-cn luci-compat"
+# 网络与分发：NAT66 用原生 masq6，此处只补内核与工具
+PACKAGES="$PACKAGES kmod-tun kmod-inet-diag kmod-nft-tproxy kmod-nft-socket kmod-br-netfilter kmod-nf-nathelper-extra kmod-tcp-bbr"
+PACKAGES="$PACKAGES ip-full ethtool-full irqbalance conntrack"
+# 首启扩容依赖：feed 里没有 growpart，用 parted/sfdisk + resize2fs
+PACKAGES="$PACKAGES parted sfdisk e2fsprogs fdisk"
+# 内存压缩 swap
+PACKAGES="$PACKAGES zram-swap kmod-zram"
+# 防检测/探测依赖
+PACKAGES="$PACKAGES curl ca-bundle jq"
+# 调试与运维（用户要求便于排障）
+PACKAGES="$PACKAGES luci-theme-argon luci-app-argon-config luci-app-ttyd luci-app-filemanager luci-app-commands openssh-sftp-server luci-app-package-manager"
+PACKAGES="$PACKAGES htop iftop tcpdump iperf3 bind-dig lm-sensors pciutils usbutils smartmontools nvme-cli rsync tmux bash jq lsof"
+PACKAGES="$PACKAGES luci-app-nlbwmon luci-app-vnstat2 luci-app-statistics luci-app-watchcat luci-app-autoreboot"
+# 存储/共享/容器
+PACKAGES="$PACKAGES luci-app-diskman luci-app-samba4 luci-app-minidlna luci-app-openlist luci-app-hd-idle"
+# 可切换的站点 profile 依赖
+PACKAGES="$PACKAGES luci-proto-ppp ppp ppp-mod-pppoe"
+
+# ============= 代理：nikki（mihomo）==============
+# 官方 25.12.2 源没有 mihomo，必须先把 nikki 上游 apk 源接进来；
+# 脚本在源不可达时会回退到 packages/ 里预置的 apk，不会中断构建。
+if [ -f shell/nikki-repo.sh ]; then
+    sh shell/nikki-repo.sh --workdir /home/build/immortalwrt || echo "nikki repo setup skipped (fallback)"
+fi
+PACKAGES="$PACKAGES nikki luci-app-nikki luci-i18n-nikki-zh-cn mihomo-meta"
+
 
 # 判断是否需要编译 Docker 插件
 if [ "$INCLUDE_DOCKER" = "yes" ]; then
-    PACKAGES="$PACKAGES luci-i18n-dockerman-zh-cn"
-    echo "Adding package: luci-i18n-dockerman-zh-cn"
+    # 光有中文语言包没有 dockerd/守护进程，docker 页签是空的
+    PACKAGES="$PACKAGES dockerd docker docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn"
+    echo "Adding docker stack: dockerd + dockerman + compose"
 fi
 
 # 若构建openclash 则添加内核
@@ -110,7 +140,7 @@ fi
 echo "$(date '+%Y-%m-%d %H:%M:%S') - Building image with the following packages:"
 echo "$PACKAGES"
 
-make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="/home/build/immortalwrt/files" ROOTFS_PARTSIZE=$PROFILE
+make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="/home/build/immortalwrt/files" ROOTFS_PARTSIZE=$PROFILE EXTRA_IMAGE_NAME="n5105"
 
 if [ $? -ne 0 ]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: Build failed!"

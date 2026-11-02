@@ -1,0 +1,73 @@
+#!/bin/sh
+# wanmode —— 站点 profile 切换
+#   wanmode list            列出可用 profile
+#   wanmode show            当前生效 profile
+#   wanmode apply <name>    切换到指定 profile
+#   wanmode set <name> <k> <v>   修改 profile 字段
+CONF=/etc/config/wanprofile
+
+q() { uci -q get "wanprofile.$1.$2" 2>/dev/null; }
+
+list() {
+	uci -q show wanprofile 2>/dev/null | sed -n "s/^wanprofile\.\([^.=]*\)=profile/\1/p"
+}
+
+show() {
+	a=$(uci -q get wanprofile.globals.active)
+	echo "active=${a:-none} proto=$(q "$a" proto) user=$(q "$a" username)"
+}
+
+apply() {
+	name=$1
+	[ -n "$name" ] || { echo "usage: wanmode apply <name>"; exit 2; }
+	proto=$(q "$name" proto)
+	[ -n "$proto" ] || { echo "unknown profile: $name"; exit 2; }
+
+	case "$proto" in
+		none)
+			uci set network.wan.proto='none'
+			uci set network.wan.auto='0'
+			;;
+		dhcp)
+			uci set network.wan.proto='dhcp'
+			uci set network.wan.auto='1'
+			uci -q delete network.wan.username
+			uci -q delete network.wan.password
+			;;
+		pppoe)
+			uci set network.wan.proto='pppoe'
+			uci set network.wan.username="$(q "$name" username)"
+			uci set network.wan.password="$(q "$name" password)"
+			uci set network.wan.auto='1'
+			uci set network.wan.peerdns='1'
+			;;
+		minieap)
+			uci set network.wan.proto='minieap'
+			uci set network.wan.username="$(q "$name" username)"
+			uci set network.wan.password="$(q "$name" password)"
+			# 上游 proto handler 用 proto_config_add_array 读 module，
+			# 写成字符串会被当成单个非法模块名丢弃，必须用 list。
+			uci -q delete network.wan.module
+			uci add_list network.wan.module="$(q "$name" module)"
+			uci set network.wan.dhcp_type="$(q "$name" dhcp_type)"
+			uci set network.wan.auto='1'
+			;;
+	esac
+	uci set wanprofile.globals.active="$name"
+	uci commit wanprofile
+	uci commit network
+	ubus call network reload >/dev/null 2>&1
+	echo "applied $name ($proto)"
+}
+
+setv() {
+	uci set "wanprofile.$1.$2=$3"; uci commit wanprofile; echo "ok"
+}
+
+case "$1" in
+	list) list ;;
+	show) show ;;
+	apply) apply "$2" ;;
+	set) setv "$2" "$3" "$4" ;;
+	*) echo "usage: wanmode list|show|apply <name>|set <name> <key> <value>" >&2; exit 2 ;;
+esac
