@@ -87,8 +87,9 @@ PACKAGES="$PACKAGES luci-proto-ppp ppp ppp-mod-pppoe"
 # ============= 代理：nikki（mihomo）==============
 # 官方 25.12.2 源没有 mihomo，必须先把 nikki 上游 apk 源接进来；
 # 脚本在源不可达时会回退到 packages/ 里预置的 apk，不会中断构建。
-if [ -f shell/nikki-repo.sh ]; then
-    sh shell/nikki-repo.sh --workdir /home/build/immortalwrt || echo "nikki repo setup skipped (fallback)"
+if [ -f /home/build/immortalwrt/shell/nikki-repo.sh ]; then
+    sh /home/build/immortalwrt/shell/nikki-repo.sh --workdir /home/build/immortalwrt \
+        || echo "nikki repo setup skipped (fallback)"
 fi
 PACKAGES="$PACKAGES nikki luci-app-nikki luci-i18n-nikki-zh-cn mihomo-meta"
 
