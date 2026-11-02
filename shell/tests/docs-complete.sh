@@ -11,7 +11,7 @@ if [ ! -d "$D" ]; then
 	exit 2
 fi
 
-for f in README.md install.md campus.md network.md ops.md compliance.md; do
+for f in README.md install.md campus.md network.md ops.md compliance.md packages.md; do
 	if [ -s "$D/$f" ]; then echo "ok: $f"; else echo "FAIL: 缺少或为空 $f"; FAIL=1; fi
 done
 
