@@ -20,39 +20,40 @@ for i in eth0 eth1 eth2 eth3; do
 done
 ```
 
-## 2. 端口顺序如何固定
+## 2. 端口顺序
 
-开机时 `/etc/init.d/portmap`（`START=15`，早于 network）按 **PCI 槽位升序**把物理口重命名为 `eth0`–`eth3`：
+本固件**不重命名网卡**。x86 上内核按 PCIe 探测顺序从 `eth0` 连续编号，四口机自然就是 `eth0`–`eth3`——与 iStoreOS 的约定一致（默认 `eth0` 是 WAN，其余是 LAN）。
 
-- 两阶段改名（先改临时名再改目标名），避免 `eth0→eth1` 时目标名被占用；
-- 只改名字，不改任何 UCI；`/etc/config/network` 静态引用 `eth0`（WAN）与 `eth1`–`eth3`（`br-lan`）；
-- 改名失败只写日志，不阻断启动。
+不重命名是有意为之：改名一旦失败，接口名与配置就会错位，表现为"桥里挂着不存在的口、插线进不去后台"。而写配置失败最坏只是"口对不上"，随时能救。
 
-查看当前顺序：
+### 确认哪个口是哪个
 
 ```sh
 ip -o link show | grep eth
 for i in eth0 eth1 eth2 eth3; do
-  printf '%s  %s  ' "$i" "$(cat /sys/class/net/$i/address)"
+  printf '%s %s ' "$i" "$(cat /sys/class/net/$i/address)"
   ethtool "$i" 2>/dev/null | sed -n 's/.*Link detected: /link=/p'
 done
 ```
 
-**如果顺序和机壳丝印不一致**（PCI 顺序不等于面板顺序），按 MAC 改写引用即可：
+插拔网线再看 `link=` 变化，就能把 `ethX` 与机壳丝印对上。
+
+### 顺序不符时改口（一分钟）
 
 ```sh
-# 1) 抄下每个物理口的 MAC
-for i in eth0 eth1 eth2 eth3; do echo "$i $(cat /sys/class/net/$i/address)"; done
-
-# 2) 把 WAN 指到真正面向上级的那个口的 MAC 对应的名字
+# 假设实际面向上级的是 eth2
 uci set network.wan.device='eth2'
 uci set network.wan6.device='eth2'
 uci set network.wan_dev.name='eth2'
+uci del_list network.br_lan.ports='eth2'
+uci add_list network.br_lan.ports='eth0'
 uci commit network
-ifup wan
+/etc/init.d/network reload
 ```
 
-改名只在开机执行一次；手工调整后重启仍然有效，因为名字是按槽位稳定生成的。
+### 首启自检
+
+首启脚本会调用 `/usr/sbin/nicsync`：按 PCI 槽位排序物理口，若与 `eth0` + `eth1..eth3` 不符，就把**真实名字**写进 UCI 并 reload，日志在 `/etc/config/nicsync.log`。它只写名字、不改接口，因此不会造成失联。
 
 ## 3. 内网地址与 DHCP
 

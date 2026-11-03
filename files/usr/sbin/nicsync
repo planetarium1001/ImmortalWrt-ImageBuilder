@@ -1,0 +1,81 @@
+#!/bin/sh
+# nicsync —— 让 network 配置里的接口名与"实际存在的物理口"对齐。
+#
+# 设计前提：本固件**不重命名网卡**。x86 上内核按 PCIe 探测顺序从 eth0 连续编号
+# （上游 commit b688bf8 已说明），四口机自然就是 eth0–eth3，和 iStoreOS 约定一致。
+# 重命名一旦失败会让接口名与配置错位、整网失联，所以这里只做"把真实名字写进配置"，
+# 最坏情况是口对不上，可救。
+#
+# 用法：
+#   nicsync            对齐并 reload
+#   nicsync --dry-run  只打印判定
+#   nicsync --sysfs DIR 指定 sysfs 根（测试用）
+
+SYSFS=/sys
+DRY=0
+LOG=/etc/config/nicsync.log
+log() { { echo "$(date '+%F %T') $*" >>"$LOG"; } 2>/dev/null || true; }
+
+for a in "$@"; do
+	case "$a" in
+		--dry-run) DRY=1 ;;
+		--sysfs) shift; SYSFS=$1 ;;
+	esac
+	shift 2>/dev/null || true
+done
+
+# 物理口列表：按 PCI 槽位升序
+list_ports() {
+	for d in "$SYSFS"/class/net/*; do
+		[ -e "$d/device" ] || continue
+		n=$(basename "$d")
+		case "$n" in eth*) ;; *) continue ;; esac
+		slot=$(sed -n 's/^PCI_SLOT_NAME=//p' "$d/device/uevent" 2>/dev/null | head -n1)
+		[ -n "$slot" ] || slot="zz-$n"
+		echo "$slot $n"
+	done | sort | awk '{print $2}'
+}
+
+ports=$(list_ports)
+if [ -z "$ports" ]; then
+	log "未发现物理口，跳过"
+	echo "no physical port"
+	exit 0
+fi
+
+want_wan=$(echo "$ports" | head -n1)
+want_lan=$(echo "$ports" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')
+
+cur_wan=$(uci -q get network.wan.device)
+cur_lan=$(uci -q get network.br_lan.ports 2>/dev/null | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+want_lan_sorted=$(echo "$want_lan" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+
+echo "wan=${want_wan} lan=${want_lan}"
+
+if [ "$cur_wan" = "$want_wan" ] && [ "$cur_lan" = "$want_lan_sorted" ]; then
+	log "配置已对齐：wan=$want_wan lan=$want_lan"
+	exit 0
+fi
+
+if [ "$DRY" = "1" ]; then
+	echo "would rewrite: wan ${cur_wan:-none} -> $want_wan ; lan [${cur_lan}] -> [$want_lan]"
+	exit 0
+fi
+
+log "对齐: wan ${cur_wan:-none} -> $want_wan ; lan [$cur_lan] -> [$want_lan]"
+uci set network.wan.device="$want_wan"
+uci set network.wan6.device="$want_wan"
+uci -q delete network.wan_dev.name
+uci set network.wan_dev.name="$want_wan"
+uci -q delete network.br_lan.ports
+for p in $want_lan; do
+	uci add_list network.br_lan.ports="$p"
+done
+uci commit network
+
+# 桥成员数与期望不符时告警，不阻断
+actual=$(ip link show master br-lan 2>/dev/null | grep -c "master br-lan")
+expect=$(echo "$want_lan" | wc -w | tr -d ' ')
+[ "$actual" = "$expect" ] || log "WARN: br-lan 实际成员 $actual，期望 $expect"
+
+[ "$DRY" = "1" ] || { /etc/init.d/network reload >/dev/null 2>&1 || true; }

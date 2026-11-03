@@ -94,7 +94,7 @@ sync
 | 步骤 | 说明 |
 |---|---|
 | 扩根分区 | `parted resizepart` + `resize2fs`，只动根分区（feed 里没有 `growpart`，所以走 parted/sfdisk） |
-| 端口角色 | `/etc/init.d/portmap boot`：按 PCI 槽位顺序重命名为 `eth0`–`eth3` |
+| 端口角色 | `/usr/sbin/nicsync`：与 `eth0`=WAN、`eth1..3`=LAN 不符时写入真实名字 |
 | 管理地址 | 写 `network.lan.ipaddr`（构建时填的 `custom_router_ip`，默认 `192.168.100.1`） |
 | WAN 关闭 | `wan.auto=0`、`wan6.auto=0`，避免无网阶段乱发包 |
 | 主机名/时间 | `n5105-router` + 安卓 TV 时间服务器映射 |

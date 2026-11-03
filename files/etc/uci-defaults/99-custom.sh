@@ -15,8 +15,12 @@ else
 fi
 
 # ---- 2. 端口角色 ----
-# 开机时 /etc/init.d/portmap 已按 PCI 顺序把物理口固定成 eth0..eth3，
-# network 配置静态引用它们，这里不再动态改 UCI，避免解析失败把桥清空。
+# 默认约定 eth0=WAN、eth1..eth3=br-lan（内核按探测顺序连续编号）。
+# 若实际物理口与配置不符，nicsync 会把【真实名字】写进 UCI——只改名字不改接口，
+# 因此不会出现"改名失败导致名字错位、整网失联"的情况。
+if [ -x /usr/sbin/nicsync ]; then
+	/usr/sbin/nicsync >>"$LOGFILE" 2>&1 || log "WARN: nicsync 执行异常，见 /etc/config/nicsync.log"
+fi
 log "ports: $(ip -o link show 2>/dev/null | awk -F': ' '/eth/{printf "%s ", $2}')"
 
 # ---- 3. 管理地址（可用 custom_router_ip.txt 覆盖）----

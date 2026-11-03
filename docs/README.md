@@ -47,7 +47,7 @@ ifup wan                            # 手动拉起 WAN
 
 # 端口
 ip -o link show | grep eth          # 看当前顺序
-/etc/init.d/portmap boot            # 重新按 PCI 顺序固定（会短暂断网）
+/usr/sbin/nicsync --dry-run          # 看接口名与配置是否一致
 
 # 扩容
 /usr/sbin/rootfs-expand --dry-run   # 只看判定，不动手
