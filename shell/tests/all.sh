@@ -6,8 +6,8 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 fail=0; pending=0
 for t in repo-shape workflows-shape readme-shape readme-flow upstream-readme \
          ext4-image-config check-packages uci-defaults-idempotent \
-         minieap-native wandetect-vote nikki-feed check-static \
-         no-site-words no-legacy-config no-rename nicsync nicsync-warn port-order rootfs-grow docs-generic hostname docs-native docs-nic \
+         minieap-native nikki-feed check-static \
+         no-site-words no-legacy-config no-extra-modules no-override-config no-rename nicsync nicsync-warn uci-defaults-nic ipv6mode hostname docs-native docs-nic \
          nat66-native no-auto-disk docs-complete; do
 	sh "$ROOT/shell/tests/$t.sh" >/tmp/t.out 2>&1
 	rc=$?

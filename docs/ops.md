@@ -14,7 +14,7 @@ scp root@192.168.100.1:/tmp/cfg-*.tar.gz .
 
 ```sh
 cp -a /etc/config/network /etc/config/network.bak
-uci revert network minieap wandetect swap
+uci revert network dhcp firewall
 ```
 
 ## 1. 认证与地址（minieap 原生配置）
@@ -215,11 +215,10 @@ uci commit nikki
 
 ```sh
 logread -e minieap -f               # 认证日志
-logread -e wandetect                # 探测日志（同时写 /var/log/wandetect.log）
 logread -e firewall                 # fw4 reload 报错
 /etc/init.d/network reload           # 改完 network 后
+/usr/sbin/ipv6mode status            # 看当前 IPv6 模式
 /etc/init.d/firewall reload          # 改完防火墙后
-/etc/init.d/wandetect restart        # 探测服务（procd 托管）
 uptime; free -m; df -h               # 资源三连
 sensors 2>/dev/null | head -20       # 温度（lm-sensors）
 for i in eth0 eth1 eth2 eth3; do ethtool "$i" 2>/dev/null | sed -n "s/.*Speed: /$i speed: /p"; done

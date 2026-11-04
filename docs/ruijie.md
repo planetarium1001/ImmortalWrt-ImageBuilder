@@ -96,7 +96,7 @@ ps w | grep -c '[m]inieap'                   # 进程数量（应为 1）
 | 4 | 认证通过但 `eth0` 没地址 | `dhcp_type` 不对 | 按第 1 节改 `2`/`3`/`0` 逐个试 |
 | 5 | 服务器提示「非指定客户端」/ 版本不符 | 接入方有客户端校验 | 依次试 `uci set network.wan.version_str='...'`、`service`、`fake_serial`、`rj_option`（见第 6 节） |
 | 6 | 认证报文发不出去，抓包看不到 `0x888e` | 组播地址不匹配 | `uci set network.wan.eap_bcast_addr='1'`，reload 后再试 |
-| 7 | 认证成功但网页打不开 | DNS / 网关 / 防火墙 | `wandetect run`、`nslookup www.baidu.com 223.5.5.5`、`fw4 print \| head -40` |
+| 7 | 认证成功但网页打不开 | DNS / 网关 / 防火墙 | `nslookup www.baidu.com 223.5.5.5`、`fw4 print \| head -40` |
 | 8 | 隔一段时间掉线 | 心跳间隔与接入方不匹配 | 调 `uci set network.wan.heartbeat='30'`（默认 60） |
 | 9 | 接入方绑定了 MAC | 换设备后认证不过 | 在 WAN 上克隆原设备 MAC：`uci set network.wan_dev.macaddr='AA:BB:CC:DD:EE:FF'; uci commit network; ifup wan` |
 | 10 | 账号本身有问题（欠费、被停用） | 与固件无关 | 用官方客户端先验证一次，再回来排 |
@@ -119,27 +119,17 @@ ubus call network reload
 
 逐项试、每改一项重启 `wan` 一次，用 `logread -e minieap -f` 看服务器返回。接入方没有客户端校验时这些留空即可。
 
-## 7. 自动探测与自动重认证
+## 7. 认证掉线怎么办
 
-`wandetect` 负责「网络是不是真的挂了」的判断，避免把「还没认证」误当断网：
-
-```sh
-wandetect run                      # 立即跑一轮，输出 online / degraded / failed
-wandetect status                   # 最近一次结果（含 http=x/y icmp=z）
-cat /var/log/wandetect.log         # 历史记录
-```
-
-投票规则（阈值在 `/etc/config/wandetect` 里，`quorum_online` / `quorum_offline`）：
-
-- HTTP 探针成功数 ≥ `quorum_online`（默认 2，共 6 个探针）→ `online`，什么都不做。
-- 成功数为 0 **且** ICMP 全挂 → `failed`，若 `trigger_minieap=1` 且存在 `/etc/init.d/minieap` 就重启认证。
-- 其余 → `degraded`，只写日志，不重启认证（防止网络抖动导致反复认证被服务器拉黑）。
-
-> 本固件的认证是 netifd 协议（`proto minieap`），没有独立的 `/etc/init.d/minieap`；需要手动重认证时用 `ifup wan` 或 `ubus call network.interface.wan down && ubus call network.interface.wan up`。
-
-探针端点都在 `/etc/config/wandetect` 里，某个 `generate_204` 端点失效时直接把那一段的 `option enabled` 改成 `0`：
+本固件不再内置探测模块。判断"是不是真掉线"用两条命令就够：
 
 ```sh
-uci set wandetect.@probe[0].enabled='0'
-uci commit wandetect
+ifstatus wan | grep -E '"up"|address'    # WAN 还有没有地址
+logread -e minieap | tail -20            # 认证进程最后说了什么
 ```
+
+- 有地址但打不开网页 → 多半是 DNS 或上游问题：`nslookup www.baidu.com 223.5.5.5`。
+- 没地址 → 认证掉了，重启认证即可：`/etc/init.d/minieap restart`。
+
+认证进程由 procd 托管，异常退出会自动拉起，一般不需要人工干预。
+

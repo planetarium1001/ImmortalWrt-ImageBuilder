@@ -16,7 +16,8 @@ done
 [ "$FAIL" = "0" ] && echo "ok: 无遗留脚本与文档"
 
 for f in x86-64/build25.sh x86-64/imm25.config README.md README.upstream.md \
-         PACKAGES.upstream.md LICENSE files/etc/config/network shell/nikki-repo.sh; do
+         PACKAGES.upstream.md LICENSE files/etc/uci-defaults/99-custom.sh \
+         files/usr/sbin/ipv6mode shell/nikki-repo.sh; do
 	if [ -e "$ROOT/$f" ]; then :; else echo "FAIL: 缺少必需文件 $f"; FAIL=1; fi
 done
 [ "$FAIL" = "0" ] && echo "ok: 必需文件齐全"

@@ -74,8 +74,7 @@ PACKAGES="$PACKAGES htop iftop tcpdump iperf3 bind-dig lm-sensors pciutils usbut
 PACKAGES="$PACKAGES luci-app-nlbwmon luci-app-vnstat2 luci-app-statistics luci-app-watchcat luci-app-autoreboot"
 # 存储/共享/容器
 PACKAGES="$PACKAGES luci-app-diskman luci-app-samba4 luci-app-minidlna luci-app-openlist luci-app-hd-idle"
-# 可切换的站点 profile 依赖
-PACKAGES="$PACKAGES luci-proto-ppp ppp ppp-mod-pppoe"
+# 说明：不含 ppp/pppoe —— 当前场景用不到，需要时再装
 
 # ============= 代理：nikki（mihomo）==============
 # 官方 25.12.2 源没有 mihomo，必须先把 nikki 上游 apk 源接进来；

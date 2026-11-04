@@ -1,0 +1,66 @@
+#!/bin/sh
+# ipv6mode —— IPv6 三态开关
+#   nat66   上级只给单地址、不给 PD 时用：内网 ULA + WAN 出口 masq6
+#   native  家宽正常下发 PD 时用：内网直接分配上级前缀，不做 NAT66
+#   off     完全关闭内网 IPv6
+#
+# 用法：ipv6mode [nat66|native|off|status]
+# 幂等：重复执行结果一致。
+
+MODE=$1
+ULA='fd7a:6e64:6c35::/48'
+
+wan6_off() { uci set network.wan6.auto='0'; uci set network.wan6.proto='dhcpv6'; }
+wan6_on()  { uci set network.wan6.auto='1'; uci set network.wan6.proto='dhcpv6'; }
+
+case "$MODE" in
+	nat66)
+		uci set network.globals.ula_prefix="$ULA"
+		wan6_off
+		# 内网发 ULA，终端地址对上级不可见
+		uci set dhcp.lan.ra='server'
+		uci set dhcp.lan.dhcpv6='server'
+		uci set dhcp.lan.ndp='disabled'
+		uci -q delete dhcp.lan.ra_flags
+		uci add_list dhcp.lan.ra_flags='managed-config'
+		uci add_list dhcp.lan.ra_flags='other-config'
+		uci set firewall.@zone[1].masq6='1'
+		;;
+	native)
+		uci -q delete network.globals.ula_prefix
+		wan6_on
+		uci set dhcp.lan.ra='server'
+		uci set dhcp.lan.dhcpv6='server'
+		uci set dhcp.lan.ndp='disabled'
+		uci -q delete dhcp.lan.ra_flags
+		uci add_list dhcp.lan.ra_flags='managed-config'
+		uci add_list dhcp.lan.ra_flags='other-config'
+		uci -q delete firewall.@zone[1].masq6
+		;;
+	off)
+		uci -q delete network.globals.ula_prefix
+		wan6_off
+		uci set dhcp.lan.ra='disabled'
+		uci set dhcp.lan.dhcpv6='disabled'
+		uci -q delete firewall.@zone[1].masq6
+		;;
+	status)
+		echo "ula_prefix: $(uci -q get network.globals.ula_prefix || echo '(none)')"
+		echo "wan6.auto : $(uci -q get network.wan6.auto || echo '(unset)')"
+		echo "lan.ra    : $(uci -q get dhcp.lan.ra || echo '(unset)')"
+		echo "wan masq6 : $(uci -q get firewall.@zone[1].masq6 || echo '(off)')"
+		exit 0
+		;;
+	*)
+		echo "usage: ipv6mode nat66|native|off|status" >&2
+		exit 2
+		;;
+esac
+
+uci commit network
+uci commit dhcp
+uci commit firewall
+/etc/init.d/network reload >/dev/null 2>&1
+/etc/init.d/dnsmasq restart >/dev/null 2>&1
+/etc/init.d/firewall reload >/dev/null 2>&1
+echo "ipv6 mode -> $MODE"

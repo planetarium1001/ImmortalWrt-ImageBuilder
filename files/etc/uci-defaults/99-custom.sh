@@ -1,65 +1,76 @@
 #!/bin/sh
-# 首次启动执行一次（uci-defaults 语义：成功后自动删除）。
-# 设计原则：无外网也可完成；重复执行结果一致；不碰数据盘。
+# 首次启动执行一次（uci-defaults 语义：成功后自删）。
+# 设计原则与上游一致：只改必要的 UCI，不整份覆盖 network/dhcp/firewall。
+# 失败不阻断启动——最坏情况退回 OpenWrt 默认（LAN 192.168.1.1），仍可登录。
 
 LOGFILE=/etc/config/uci-defaults-log.txt
 log() { echo "$(date '+%F %T') $*" >>"$LOGFILE" 2>/dev/null; }
 
 log "=== 99-custom start ==="
 
-# ---- 1. 扩容（按挂载点反查，见 /usr/sbin/rootfs-expand）----
-if [ -x /usr/sbin/rootfs-expand ]; then
-	/usr/sbin/rootfs-expand >>"$LOGFILE" 2>&1 || log "rootfs-expand 执行异常，见 /etc/config/rootfs-expand.log"
+# ---- 1. 枚举物理网口（上游式：首个为 WAN，其余全部入桥）----
+ifnames=""
+for iface in /sys/class/net/*; do
+	name=$(basename "$iface")
+	[ -e "$iface/device" ] || continue
+	case "$name" in eth*|en*) ifnames="$ifnames $name" ;; esac
+done
+ifnames=$(echo "$ifnames" | awk '{$1=$1};1')
+count=$(echo "$ifnames" | wc -w | tr -d ' ')
+log "physical interfaces: [$ifnames] count=$count"
+
+if [ "$count" -eq 1 ]; then
+	# 单网口：按旁路由处理，LAN 走 DHCP
+	uci set network.lan.proto='dhcp'
+	uci -q delete network.lan.ipaddr
+	uci -q delete network.lan.netmask
+	log "single-port mode: lan=dhcp"
+elif [ "$count" -gt 1 ]; then
+	wan_if=$(echo "$ifnames" | awk '{print $1}')
+	lan_ifs=$(echo "$ifnames" | cut -d ' ' -f2-)
+
+	uci set network.wan=interface
+	uci set network.wan.device="$wan_if"
+	uci set network.wan.proto='dhcp'
+	uci set network.wan.auto='0'          # 认证/拨号由用户显式启用
+
+	uci set network.wan6=interface
+	uci set network.wan6.device="$wan_if"
+	uci set network.wan6.proto='dhcpv6'
+	uci set network.wan6.auto='0'
+
+	sec=$(uci show network | awk -F '[.=]' '/\.@?device\[\d+\]\.name=.br-lan.$/ {print $2; exit}')
+	[ -n "$sec" ] || sec="br_lan"
+	uci -q delete "network.$sec.ports"
+	for p in $lan_ifs; do uci add_list "network.$sec.ports=$p"; done
+
+	# 管理地址
+	IP_FILE=/etc/config/custom_router_ip.txt
+	if [ -f "$IP_FILE" ]; then IP=$(tr -d ' \n' <"$IP_FILE"); else IP=192.168.100.1; fi
+	case "$IP" in *[!0-9.]*|"") IP=192.168.100.1 ;; esac
+	uci set network.lan.ipaddr="$IP"
+	uci set network.lan.netmask='255.255.255.0'
+	log "multi-port: wan=$wan_if lan=[$lan_ifs] ip=$IP"
 else
-	log "WARN: 缺少 /usr/sbin/rootfs-expand，跳过扩容"
+	log "WARN: 未发现物理网口，保持 OpenWrt 默认"
 fi
-
-# ---- 2. 端口角色 ----
-# 默认约定 eth0=WAN、eth1..eth3=br-lan（内核按探测顺序连续编号）。
-# 若实际物理口与配置不符，nicsync 会把【真实名字】写进 UCI——只改名字不改接口，
-# 因此不会出现"改名失败导致名字错位、整网失联"的情况。
-if [ -x /usr/sbin/nicsync ]; then
-	/usr/sbin/nicsync >>"$LOGFILE" 2>&1 || log "WARN: nicsync 执行异常，见 /etc/config/nicsync.log"
-fi
-log "ports: $(ip -o link show 2>/dev/null | awk -F': ' '/eth/{printf "%s ", $2}')"
-
-# ---- 3. 管理地址（可用 custom_router_ip.txt 覆盖）----
-IP_FILE=/etc/config/custom_router_ip.txt
-if [ -f "$IP_FILE" ]; then
-	IP=$(cat "$IP_FILE" | tr -d ' \n')
-else
-	IP=192.168.100.1
-fi
-case "$IP" in
-	*[!0-9.]*|"") IP=192.168.100.1 ;;
-esac
-uci set network.lan.ipaddr="$IP"
-uci commit network
-log "lan ip = $IP"
-
-# ---- 4. WAN 出厂保持关闭，等用户配置或 profile 切换 ----
-# WAN 保持 auto=0：认证与取地址由用户显式启用，避免无网阶段刷日志
-uci set network.wan.auto='0'
-uci set network.wan6.auto='0'
 uci commit network
 
-# ---- 5. 管理面可达性：ttyd/ssh 不绑接口，root 可登录 ----
+# ---- 2. IPv6 模式（默认 nat66，可用 ipv6mode 切换）----
+if [ -x /usr/sbin/ipv6mode ]; then
+	/usr/sbin/ipv6mode nat66 >>"$LOGFILE" 2>&1 || log "WARN: ipv6mode 执行失败"
+fi
+
+# ---- 3. 主机名 ----
+uci set system.@system[0].hostname='ImmortalWrt'
+uci commit system
+
+# ---- 4. 管理面可达：ttyd/ssh 不绑接口 ----
 uci -q delete ttyd.@ttyd[0].interface
 uci set dropbear.@dropbear[0].Interface=''
 uci commit
 
-# ---- 6. 主机名与时间 ----
-uci set system.@system[0].hostname='ImmortalWrt'
-uci commit system
-
-# 安卓 TV 时间服务器映射（保留原仓库行为）
-uci -q delete dhcp.androidtime
-uci add dhcp domain >/dev/null
-uci set "dhcp.@domain[-1].name=time.android.com"
-uci set "dhcp.@domain[-1].ip=203.107.6.88"
-uci commit dhcp
-
-# ---- 7. docker 区域（装了 dockerd 才加）----
+# ---- 5. docker 区域（只在装了 dockerd 时加）----
 if command -v dockerd >/dev/null 2>&1; then
 	uci -q delete firewall.docker
 	uci set firewall.docker=zone
@@ -72,15 +83,11 @@ if command -v dockerd >/dev/null 2>&1; then
 	log "docker zone ensured"
 fi
 
-# ---- 8. 关闭 i226 的 EEE（稳定性基线）----
-for i in $(ls /sys/class/net | grep -E '^eth'); do
-	if command -v ethtool >/dev/null 2>&1; then
-		ethtool --set-eee "$i" eee off >/dev/null 2>&1 && log "eee off on $i"
-	fi
-done
+# ---- 6. swap（swapfile + zram）----
+[ -x /usr/sbin/swapctl ] && /usr/sbin/swapctl apply >>"$LOGFILE" 2>&1
 
-# ---- 9. swapfile（可调，默认 4G；zram 由包自带）----
-/usr/sbin/swapctl apply >>"$LOGFILE" 2>&1 || log "swapctl not available"
+# ---- 7. 接口名与配置对齐（不重命名，只写真实名字）----
+[ -x /usr/sbin/nicsync ] && /usr/sbin/nicsync >>"$LOGFILE" 2>&1 || log "WARN: nicsync 执行异常"
 
 log "=== 99-custom done ==="
 exit 0

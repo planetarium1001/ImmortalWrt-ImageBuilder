@@ -9,7 +9,6 @@
 - **认证**：minieap（锐捷 v3），配置文件 `/etc/minieap.conf`，开机自启 `/etc/init.d/minieap`
 - **地址**：WAN 用原生 `proto dhcp`；IPv6 由网络侧决定，内网终端走 ULA + NAT66
 - **端口**：开机按 PCI 槽位顺序固定为 `eth0`–`eth3`，与内核枚举顺序无关
-- **探测**：`/usr/sbin/wandetect` 多探针投票，判定 WAN 是否可用（默认不启用）
 - **代理**：nikki（mihomo）白名单模式，出厂关闭
 - **容器**：dockerd + dockerman，构建时 `include_docker=yes` 才包含
 - **运维**：LuCI 自定义命令、在线文件编辑、网页终端
@@ -49,14 +48,11 @@ ifup wan                            # 手动拉起 WAN
 ip -o link show | grep eth          # 看当前顺序
 /usr/sbin/nicsync --dry-run          # 看接口名与配置是否一致
 
-# 扩容
-/usr/sbin/rootfs-expand --dry-run   # 只看判定，不动手
-/usr/sbin/rootfs-expand --verbose   # 执行并打印
-cat /etc/config/rootfs-expand.log   # 历史记录
-
-# 检测
-/usr/sbin/wandetect run             # 跑一轮探测
-/usr/sbin/wandetect status          # 最近一次结果
+# IPv6
+/usr/sbin/ipv6mode status           # 看当前模式
+/usr/sbin/ipv6mode native           # 家宽下发 PD 时用
+/usr/sbin/ipv6mode nat66            # 上级只给单地址时用
+/usr/sbin/ipv6mode off              # 关掉内网 IPv6
 
 # swap
 /usr/sbin/swapctl status
@@ -69,6 +65,5 @@ cat /etc/config/rootfs-expand.log   # 历史记录
 |---|---|
 | `/etc/minieap.conf` | 认证配置（唯一入口） |
 | `/etc/config/network` | 接口与端口引用 |
-| `/etc/config/rootfs-expand.log` | 扩容日志 |
 | `/etc/config/uci-defaults-log.txt` | 首启脚本日志 |
 | `/var/log/minieap.log` | minieap 自身日志 |
