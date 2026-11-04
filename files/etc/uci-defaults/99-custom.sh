@@ -32,12 +32,10 @@ elif [ "$count" -gt 1 ]; then
 	uci set network.wan=interface
 	uci set network.wan.device="$wan_if"
 	uci set network.wan.proto='dhcp'
-	uci set network.wan.auto='0'          # 认证/拨号由用户显式启用
 
 	uci set network.wan6=interface
 	uci set network.wan6.device="$wan_if"
 	uci set network.wan6.proto='dhcpv6'
-	uci set network.wan6.auto='0'
 
 	sec=$(uci show network | awk -F '[.=]' '/\.@?device\[\d+\]\.name=.br-lan.$/ {print $2; exit}')
 	[ -n "$sec" ] || sec="br_lan"

@@ -10,12 +10,15 @@ start_service() {
 		logger -t minieap "缺少 /etc/minieap.conf，跳过启动"
 		return 0
 	}
-	# 账号为空时不必启动，避免无意义的重试刷日志
+	# 出厂 conf 不含有效参数；软件包自带的示例值是 example/changeme，
+	# 这两种情况都不启动，避免拿假账号空转刷日志。
 	user=$(sed -n 's/^username=//p' /etc/minieap.conf | head -n1)
-	[ -n "$user" ] || {
-		logger -t minieap "username 为空，跳过启动"
-		return 0
-	}
+	case "$user" in
+		""|example)
+			logger -t minieap "username 未配置，跳过启动（先手动跑一次 minieap -w）"
+			return 0
+			;;
+	esac
 
 	procd_open_instance minieap
 	# 只传 --conf-file：其余参数全部来自配置文件。

@@ -7,7 +7,7 @@ fail=0; pending=0
 for t in repo-shape workflows-shape readme-shape readme-flow upstream-readme \
          ext4-image-config check-packages uci-defaults-idempotent \
          minieap-native nikki-feed check-static \
-         no-site-words no-legacy-config no-extra-modules no-override-config no-rename nicsync nicsync-warn uci-defaults-nic ipv6mode hostname docs-native docs-nic \
+         no-site-words no-legacy-config no-extra-modules no-override-config no-rename nicsync nicsync-warn uci-defaults-nic ipv6mode ipv6mode-memory minieap-empty-conf minieap-skip wan-auto hostname docs-native docs-nic docs-auth \
          nat66-native no-auto-disk docs-complete; do
 	sh "$ROOT/shell/tests/$t.sh" >/tmp/t.out 2>&1
 	rc=$?

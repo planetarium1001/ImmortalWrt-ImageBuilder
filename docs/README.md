@@ -35,7 +35,9 @@
 
 ```sh
 # 认证
-vi /etc/minieap.conf                # 唯一配置入口
+# 首次：手动认证一次，-w 把参数写回 /etc/minieap.conf
+minieap -u 账号 -p 密码 -n eth1 --module rjv3 -d 0 -w
+vi /etc/minieap.conf                # 之后可直接编辑
 /etc/init.d/minieap restart         # 重载认证
 logread -e minieap -f               # 实时日志
 /usr/sbin/minieap -u 账号 -p 密码 -n eth0 --module rjv3   # 手工试跑
@@ -53,6 +55,7 @@ ip -o link show | grep eth          # 看当前顺序
 /usr/sbin/ipv6mode native           # 家宽下发 PD 时用
 /usr/sbin/ipv6mode nat66            # 上级只给单地址时用
 /usr/sbin/ipv6mode off              # 关掉内网 IPv6
+/usr/sbin/ipv6mode forget native    # 丢弃该模式的记忆，回到模板
 
 # swap
 /usr/sbin/swapctl status

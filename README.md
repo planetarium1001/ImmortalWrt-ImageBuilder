@@ -19,9 +19,9 @@
 | 文件系统 | 新增 ext4 根（上游 squashfs 产物并存，实际刷写用 ext4），根分区固定 2G |
 | 端口 | 按 MAC / PCI 槽位固定角色，不依赖内核枚举顺序 |
 | 认证 | 内置 minieap（锐捷 v3），WAN 多探针投票后按需触发 |
-| IPv6 | 三态开关：`nat66`（ULA+masq6）/ `native`（原生 PD）/ `off` |
+| IPv6 | 三态开关 `nat66`/`native`/`off`，每个模式各自记忆调整 |
 | 代理 | nikki（mihomo）走上游 apk 源，白名单透明代理 |
-| 认证 | 单一配置 `/etc/minieap.conf` + `/etc/init.d/minieap` 开机自启 |
+| 认证 | `/etc/minieap.conf` 由首次手动认证生成，`/etc/init.d/minieap` 开机自启 |
 | 运维 | 参数文件与开关均可在 LuCI 内修改，无需重刷 |
 
 ## 快速开始
@@ -77,7 +77,7 @@ squashfs 镜像则扩 `/overlay` 所在分区后 `resize.f2fs`/`resize2fs`。
 
 1. **枚举物理网口**：读出所有真实网口，第一个作为 WAN，其余全部加入 `br-lan`；不重命名网卡，写进配置的就是真实名字。
 2. **写入管理地址**：取构建参数 `custom_router_ip`，缺省 `192.168.100.1`。
-3. **WAN 保持关闭**：`auto=0`，认证与取地址由你显式启用。
+3. **WAN 自动取地址**：沿用上游默认，认证放行后 netifd 的 DHCP 客户端立即拿到地址。
 4. **应用 IPv6 模式**：默认 `nat66`，可一键切 `native` / `off`。
 5. **服务就绪**：启用 ttyd、SSH、swap、并补齐 docker 区域（若装了容器）。
 
@@ -92,6 +92,7 @@ squashfs 镜像则扩 `/overlay` 所在分区后 `resize.f2fs`/`resize2fs`。
 - **刷写不可逆**：写入会清空目标盘全部分区，刷前确认盘符并备份数据。
 - **根分区只有 2G**：装大量容器前先按上文手工扩容，否则 `/` 会先满。
 - **代理默认关闭**：nikki 出厂 `enabled=0`，先让认证跑通再启用。
+- **认证需手动初始化一次**：出厂 `/etc/minieap.conf` 为空，先按 [锐捷认证](docs/ruijie.md) 手动跑一次并加 `-w`。
 
 ## 内置软件
 
