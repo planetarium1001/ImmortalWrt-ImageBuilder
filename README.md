@@ -17,17 +17,18 @@
 |---|---|
 | 目标 | 移除其余 9 个平台目录与全部非 x86-64 workflow，只保留本机型 |
 | 文件系统 | 新增 ext4 根（上游 squashfs 产物并存，实际刷写用 ext4），根分区固定 2G |
-| 端口 | 按 MAC / PCI 槽位固定角色，不依赖内核枚举顺序 |
-| 认证 | 内置 minieap（锐捷 v3），WAN 多探针投票后按需触发 |
-| IPv6 | 三态开关 `nat66`/`native`/`off`，每个模式各自记忆调整 |
+| 端口 | 首个物理口为 WAN，其余入桥；按 PCI `bus:dev.fn` 数值序判定，不重命名网卡 |
+| 认证 | 内置 minieap（锐捷 v3），campus profile 下自动 `enable` + `start` |
+| 场景切换 | `netprofile`（默认 campus）↔ `netprofile home`，两套配置各自记住手改内容 |
+| IPv6 | campus 默认 NAT66（下游不暴露独立地址）；home 走上游默认 |
+| 防检测 | fw4 的 `config include` 承载：TTL/HopLimit 归一、发现协议兜底；二档默认关 |
 | 代理 | nikki（mihomo）走上游 apk 源，白名单透明代理 |
-| 认证 | `/etc/minieap.conf` 由首次手动认证生成，`/etc/init.d/minieap` 开机自启 |
 | 运维 | 参数文件与开关均可在 LuCI 内修改，无需重刷 |
 
 ## 快速开始
 
 1. Fork 本仓库。
-2. Actions 中选择 **Build N5105 x86_64 25.12.x**，Run workflow。
+2. Actions 中选择 **Build N5105 x86_64 25.12.x**，Run workflow。（固件不含 `owut`：它重建的镜像不带本仓库定制，升级请重跑本流水线）
 3. 填写参数：
    - `luci_version`：`25.12.2`（workflow 默认值即为该版本）
    - `custom_router_ip`：管理地址，默认 `192.168.100.1`
@@ -112,7 +113,8 @@ squashfs 镜像则扩 `/overlay` 所在分区后 `resize.f2fs`/`resize2fs`。
 
 - [安装与首次启动](docs/install.md)：写盘、首启动作、进入后台
 - [锐捷认证](docs/ruijie.md)：minieap 配置与排障
-- [网络与端口](docs/network.md)：端口角色、AP 模式、NAT66
+- [网络与端口](docs/network.md)：端口分配、改口、AP 模式、NAT66
+- [家/校双 profile](docs/profile.md)：`netprofile` 切换、防检测一档/二档、记忆机制
 - [内置软件](docs/packages.md)：追加的软件、用途与上游链接
 - [日常运维](docs/ops.md)：认证与地址、swap、docker、回滚
 - [使用条款与责任](docs/compliance.md)：合规边界

@@ -1,0 +1,35 @@
+# /etc/campus/nft/10-ttl.nft.tmpl —— 防检测一档：出口 TTL / HopLimit 归一
+# 本文件是模板，不是 fw4 收录的对象；fw4 收录的是 render.sh 渲染出的 10-ttl.nft。
+# 只含规则行，不含 table / chain 声明（片段会被 include 进已有链的内部）。
+# 规则数：2 条。
+# 计数约定：文件内该标记（含下方“真机验证”里的 grep 示例）出现次数 = 规则数 + 1。
+#
+# 预期生效方式：
+#   config include 'campus_ttl'
+#       option type 'nftables'
+#       option path '/etc/campus/nft/10-ttl.nft'
+#       option position 'chain-append'
+#       option chain 'mangle_forward'
+#       option enabled '1'      # campus=1 / home=0，由 netprofile 切换
+#   → 片段被 include 进 table inet fw4 的 mangle_forward 链尾部
+#     （type filter hook forward priority mangle），只作用于"被转发"的流量。
+#   为什么落 mangle_forward：内核在 forward 钩子之前就做了 TTL 递减
+#   （ip_decrease_ttl()/hop_limit--），所以在 forward 内写 64，出网即 64；
+#   路由器自身的包不走 forward 钩子，本机 traceroute/ping 不受影响。
+#   前置条件：firewall.@defaults[0].flow_offloading 必须保持 '0'，
+#   已 offload 的流绕过 mangle，TTL 只对首包生效。
+#
+# 占位符：@WAN@ = WAN 出接口名。由 /etc/campus/nft/render.sh 从 uci
+#   network.wan.device（兜底 wan6.device / ubus）读取后替换，镜像里不写死 eth0/eth1。
+#   WAN 设备变化后必须重跑 `sh /etc/campus/nft/render.sh` 再 `fw4 reload`，
+#   否则规则会静默匹配不到出接口。
+#
+# 真机验证（本机无 nft，未实测，属部署清单项）：
+#   nft list chain inet fw4 mangle_forward | grep -c '!campus'      # 期望 2
+#   tcpdump -ni <wan> -vv -c 20 'ip'     # 期望 ttl 恒 64、无 bad checksum
+#   tcpdump -ni <wan> -vv -c 20 'ip6'    # 期望 hlim 恒 64
+#   从 LAN 终端 traceroute -n 223.5.5.5  # 预期只剩一跳（已知副作用）
+#   关闭：uci set firewall.campus_ttl.enabled='0'; uci commit firewall; fw4 reload
+#
+meta nfproto ipv4 oifname "@WAN@" ip ttl set 64 counter comment "!campus: ttl norm"
+meta nfproto ipv6 oifname "@WAN@" ip6 hoplimit set 64 counter comment "!campus: hl norm"

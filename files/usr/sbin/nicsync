@@ -1,81 +1,166 @@
 #!/bin/sh
-# nicsync —— 让 network 配置里的接口名与"实际存在的物理口"对齐。
+# nicsync —— 端口配置的**只读校验**（默认）与显式修复（--fix）。
 #
-# 设计前提：本固件**不重命名网卡**。x86 上内核按 PCIe 探测顺序从 eth0 连续编号
-# （上游 commit b688bf8 已说明），四口机自然就是 eth0–eth3，和 iStoreOS 约定一致。
-# 重命名一旦失败会让接口名与配置错位、整网失联，所以这里只做"把真实名字写进配置"，
-# 最坏情况是口对不上，可救。
+# 设计前提：本固件**不重命名网卡**。x86 上内核按 PCIe 探测顺序从 eth0 连续编号，
+# 四口机自然就是 eth0–eth3。重命名一旦失败会让接口名与配置错位、整网失联，
+# 所以这里永不改名，只核对"配置里的名字"与"真实存在的物理口"。
+#
+# 端口分配的单一真源是 /lib/functions/netports.sh（与首启 99-custom.sh 共用）：
+# 该库负责定位真实设备段（25.12 出厂是匿名 config device，没有 network.br_lan），
+# 本脚本只做 读现状 → 与物理口对比 → 报告（默认）或写回（--fix）。
 #
 # 用法：
-#   nicsync            对齐并 reload
-#   nicsync --dry-run  只打印判定
-#   nicsync --sysfs DIR 指定 sysfs 根（测试用）
+#   nicsync              等价 --check：对齐返回 0，不齐返回 2，错误返回 1；**不写配置**
+#   nicsync --check      同上
+#   nicsync --fix        不对齐时写 wan.device/wan6.device/<设备段>.ports 并 reload
+#   nicsync --dry-run    只打印判定，总是返回 0
+#   nicsync --sysfs DIR  指定 sysfs 根（测试用），默认 /sys
+#   nicsync --no-reload  --fix 后不 reload network（测试/手工用）
+#   nicsync --log FILE   指定日志文件，默认 /etc/config/nicsync.log
 
-SYSFS=/sys
-DRY=0
+SYSFS=${NETPORTS_SYSFS:-/sys}
+MODE=check
+RELOAD=1
 LOG=/etc/config/nicsync.log
 log() { { echo "$(date '+%F %T') $*" >>"$LOG"; } 2>/dev/null || true; }
 
-for a in "$@"; do
-	case "$a" in
-		--dry-run) DRY=1 ;;
-		--sysfs) shift; SYSFS=$1 ;;
-	esac
-	shift 2>/dev/null || true
-done
-
-# 物理口列表：按 PCI 槽位升序
-list_ports() {
-	for d in "$SYSFS"/class/net/*; do
-		[ -e "$d/device" ] || continue
-		n=$(basename "$d")
-		case "$n" in eth*) ;; *) continue ;; esac
-		slot=$(sed -n 's/^PCI_SLOT_NAME=//p' "$d/device/uevent" 2>/dev/null | head -n1)
-		[ -n "$slot" ] || slot="zz-$n"
-		echo "$slot $n"
-	done | sort | awk '{print $2}'
+usage() {
+	sed -n '3,20p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
 }
 
-ports=$(list_ports)
-if [ -z "$ports" ]; then
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--check) MODE=check ;;
+		--fix) MODE=fix ;;
+		--dry-run) MODE=dry ;;
+		--no-reload) RELOAD=0 ;;
+		--sysfs) shift; SYSFS=${1:-/sys} ;;
+		--log) shift; LOG=${1:-/etc/config/nicsync.log} ;;
+		-h|--help) usage; exit 0 ;;
+		*)
+			echo "nicsync: 未知参数 [$1], 可用: --check | --fix | --dry-run" >&2
+			exit 1
+			;;
+	esac
+	shift
+done
+
+# 库与脚本同在固件的 /lib/functions；仓库内跑测试时按相对路径回溯。
+NETPORTS_LIB=${NETPORTS_LIB:-/lib/functions/netports.sh}
+[ -r "$NETPORTS_LIB" ] || NETPORTS_LIB="$(dirname "$0")/../../lib/functions/netports.sh"
+if [ ! -r "$NETPORTS_LIB" ]; then
+	echo "nicsync: 找不到 netports 库 [$NETPORTS_LIB]" >&2
+	log "ERROR: 找不到 netports 库 [$NETPORTS_LIB]"
+	exit 1
+fi
+NETPORTS_SYSFS=$SYSFS
+export NETPORTS_SYSFS
+. "$NETPORTS_LIB"
+
+# 物理口列表：netports_phys 已按 PCI bus:dev.fn 数值升序（不再用字符串字典序）
+phys=$(netports_phys)
+if [ -z "$phys" ]; then
 	log "未发现物理口，跳过"
 	echo "no physical port"
 	exit 0
 fi
 
-want_wan=$(echo "$ports" | head -n1)
-want_lan=$(echo "$ports" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')
+# 集合比较用"排序去重"，避免成员顺序不同被判成不齐
+norm() { printf '%s\n' $1 | sed '/^$/d' | sort -u | tr '\n' ' ' | sed 's/ *$//'; }
 
-cur_wan=$(uci -q get network.wan.device)
-cur_lan=$(uci -q get network.br_lan.ports 2>/dev/null | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ *$//')
-want_lan_sorted=$(echo "$want_lan" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+cur_wan=$(uci -q get network.wan.device 2>/dev/null)
 
-echo "wan=${want_wan} lan=${want_lan}"
+sec=""
+if sec=$(netports_dev_section); then
+	:
+else
+	# 定位失败：不改配置、非 0 退出（不猜段名，否则只会在真机上静默失败）
+	echo "ERROR: 定位不到 LAN 设备段（network.lan.device 与 br-lan 均未命中），未改配置" >&2
+	log "ERROR: 定位不到 LAN 设备段，未改配置"
+	exit 1
+fi
+cur_lan=$(netports_ports_of "$sec")
 
-if [ "$cur_wan" = "$want_wan" ] && [ "$cur_lan" = "$want_lan_sorted" ]; then
-	log "配置已对齐：wan=$want_wan lan=$want_lan"
+# 现有 WAN 口若仍是物理口就保留（N6：不主动换口，避免用户手工指定被覆盖）
+if [ -n "$cur_wan" ] && printf '%s\n' "$phys" | grep -qxF "$cur_wan"; then
+	want_wan=$cur_wan
+else
+	want_wan=$(printf '%s\n' "$phys" | head -n1)
+fi
+want_lan=$(printf '%s\n' "$phys" | grep -vxF "$want_wan" | tr '\n' ' ' | sed 's/ *$//')
+
+cur_lan_n=$(norm "$cur_lan")
+want_lan_n=$(norm "$want_lan")
+
+echo "wan=${want_wan} lan=${want_lan_n} device=${sec}"
+
+aligned=0
+if [ "$cur_wan" = "$want_wan" ] && [ "$cur_lan_n" = "$want_lan_n" ]; then
+	aligned=1
+fi
+
+# 桥成员数核对只在设备启动后有意义（首启 uci-defaults 阶段 netifd 未起，恒为 0），
+# 所以放在 --check 里，且只告警不阻断。
+bridge_members() {
+	command -v ip >/dev/null 2>&1 || return 0
+	_actual=$(ip link show master br-lan 2>/dev/null | grep -c "master br-lan")
+	[ -n "$_actual" ] || return 0
+	_expect=$(echo "$want_lan" | wc -w | tr -d ' ')
+	if [ "$_actual" != "$_expect" ]; then
+		log "WARN: br-lan 实际成员 $_actual 个, 期望 $_expect 个"
+		echo "WARN: br-lan 实际成员 $_actual, 期望 $_expect 个（netifd 刚起时可能尚未把口加进桥）" >&2
+	fi
+	return 0
+}
+
+if [ "$MODE" = "dry" ]; then
+	if [ "$aligned" = "1" ]; then
+		echo "配置已对齐: wan=$want_wan lan=[$want_lan_n]"
+	else
+		echo "would fix: wan ${cur_wan:-none} -> $want_wan ; lan [${cur_lan_n}] -> [$want_lan_n] (device=$sec)"
+	fi
 	exit 0
 fi
 
-if [ "$DRY" = "1" ]; then
-	echo "would rewrite: wan ${cur_wan:-none} -> $want_wan ; lan [${cur_lan}] -> [$want_lan]"
+if [ "$aligned" = "1" ]; then
+	echo "配置已对齐: wan=$want_wan lan=[$want_lan_n] (device=$sec)"
+	log "配置已对齐: wan=$want_wan lan=[$want_lan_n] device=$sec"
+	[ "$MODE" = "check" ] && bridge_members
 	exit 0
 fi
 
-log "对齐: wan ${cur_wan:-none} -> $want_wan ; lan [$cur_lan] -> [$want_lan]"
-uci set network.wan.device="$want_wan"
-uci set network.wan6.device="$want_wan"
-uci -q delete network.wan_dev.name
-uci set network.wan_dev.name="$want_wan"
-uci -q delete network.br_lan.ports
-for p in $want_lan; do
-	uci add_list network.br_lan.ports="$p"
-done
-uci commit network
+# 只有一个物理口时"对齐"等于把桥成员全清空（旁路由），风险由人承担，不自动做
+if [ -z "$want_lan" ]; then
+	echo "单网口: 只有 1 个物理口 [$want_wan], 桥成员 [${cur_lan_n}] 需人工确认（本脚本不自动清空桥）" >&2
+	log "单网口: 不做自动修复, 桥成员 [${cur_lan_n}]"
+	[ "$MODE" = "check" ] && exit 2
+	exit 1
+fi
 
-# 桥成员数与期望不符时告警，不阻断
-actual=$(ip link show master br-lan 2>/dev/null | grep -c "master br-lan")
-expect=$(echo "$want_lan" | wc -w | tr -d ' ')
-[ "$actual" = "$expect" ] || log "WARN: br-lan 实际成员 $actual，期望 $expect"
+if [ "$MODE" = "check" ]; then
+	echo "不齐: wan ${cur_wan:-none} -> $want_wan ; lan [${cur_lan_n}] -> [$want_lan_n] (device=$sec)" >&2
+	log "不齐: wan ${cur_wan:-none} -> $want_wan ; lan [${cur_lan_n}] -> [$want_lan_n] device=$sec"
+	exit 2
+fi
 
-[ "$DRY" = "1" ] || { /etc/init.d/network reload >/dev/null 2>&1 || true; }
+# ---- --fix ----
+# netports_apply 内部回滚：写失败不会留下半套配置，也不会把 wan 留在桥成员里。
+if ! netports_apply "$want_wan" $want_lan; then
+	echo "ERROR: 写端口失败（配置已回滚），详见日志 $LOG" >&2
+	log "ERROR: 写端口失败，配置已回滚"
+	exit 1
+fi
+if ! uci commit network; then
+	echo "ERROR: uci commit network 失败" >&2
+	log "ERROR: uci commit network 失败"
+	exit 1
+fi
+log "对齐: wan ${cur_wan:-none} -> $want_wan ; lan [$cur_lan_n] -> [$want_lan_n] device=$sec"
+echo "已写入: wan=$want_wan lan=[$want_lan_n] (device=$sec)"
+
+if [ "$RELOAD" = "1" ]; then
+	/etc/init.d/network reload >/dev/null 2>&1 || log "WARN: /etc/init.d/network reload 失败"
+fi
+
+[ "$MODE" = "fix" ] && bridge_members
+exit 0

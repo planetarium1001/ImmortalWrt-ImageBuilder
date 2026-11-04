@@ -1,0 +1,17 @@
+# LuCI「命令」页按钮（luci-app-commands）。三个按钮就是 netprofile 的三个入口。
+# 免去 ssh：后台 → 系统 → 命令 里点一下就切换。
+
+config command 'netprofile_campus'
+	option name '切换到 campus（默认）'
+	option command '/usr/sbin/netprofile campus'
+	option description 'NAT66 + 防检测一档 + 认证自启；不带参数执行 netprofile 等价于此'
+
+config command 'netprofile_home'
+	option name '切换到 home'
+	option command '/usr/sbin/netprofile home'
+	option description '关闭防检测与 NAT66，认证停用；受管项会存档，切回 campus 时恢复'
+
+config command 'netprofile_status'
+	option name '查看当前 profile'
+	option command '/usr/sbin/netprofile status'
+	option description '显示 16 个受管键的实际值与模板/存档差异'

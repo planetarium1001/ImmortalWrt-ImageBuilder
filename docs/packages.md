@@ -46,7 +46,7 @@
 | `luci-theme-argon` / `luci-app-argon-config` | 界面主题与其配置 | 官方源；上游 <https://github.com/jerrykuku/luci-theme-argon> |
 | `luci-app-ttyd` | Web 终端 | 官方源；上游 <https://github.com/ttyd/ttyd> |
 | `luci-app-filemanager` | Web 文件管理（可在线改配置文件） | 官方源 |
-| `luci-app-commands` | 自定义命令按钮（防检测开关、重新探测等） | 官方源 |
+| `luci-app-commands` | 自定义命令按钮（可放 `netprofile home` / `netprofile status` 等一键按钮） | 官方源 |
 | `luci-app-package-manager` | 25.12 的 apk 包管理界面 | 官方源 |
 | `openssh-sftp-server` | SFTP 传输 | 官方源；上游 <https://github.com/openssh/openssh-portable> |
 | `luci-app-nlbwmon` / `luci-app-vnstat2` / `luci-app-statistics` | 流量与系统统计 | 官方源 |

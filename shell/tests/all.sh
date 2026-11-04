@@ -4,16 +4,12 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 fail=0; pending=0
-for t in repo-shape workflows-shape readme-shape readme-flow upstream-readme \
-         ext4-image-config check-packages uci-defaults-idempotent \
-         minieap-native nikki-feed check-static \
-         no-site-words no-legacy-config no-extra-modules no-override-config no-rename nicsync nicsync-warn uci-defaults-nic ipv6mode ipv6mode-memory minieap-empty-conf minieap-skip wan-auto hostname docs-native docs-nic docs-auth \
-         nat66-native no-auto-disk docs-complete; do
+for t in repo-shape workflows-shape readme-shape readme-flow upstream-readme ext4-image-config check-packages uci-fake uci-defaults-idempotent uci-defaults-nic minieap-native nikki-feed check-static no-site-words no-legacy-config no-extra-modules no-override-config no-rename no-iptables netports-truth netports-fail-closed nicsync nicsync-idempotent nicsync-warn ipv6mode ipv6mode-memory netprofile-switch netprofile-memory netprofile-templates netprofile-render netprofile-rollback minieap-empty-conf minieap-skip wan-auto hostname docs-native docs-nic docs-auth docs-profile nat66-native no-auto-disk docs-complete campus-rules-scope device-verify; do
 	sh "$ROOT/shell/tests/$t.sh" >/tmp/t.out 2>&1
 	rc=$?
 	case $rc in
 		0) echo "PASS  $t" ;;
-		2) echo "PEND  $t"; pending=$((pending+1)) ;;
+		2) echo "PEND  $t"; sed 's/^/      /' /tmp/t.out | tail -3; pending=$((pending+1)) ;;
 		*) echo "FAIL  $t"; sed 's/^/      /' /tmp/t.out | tail -12; fail=$((fail+1)) ;;
 	esac
 done

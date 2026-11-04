@@ -1,57 +1,62 @@
 #!/bin/sh
-# ac-4：首启脚本离线可执行且幂等（用桩模拟 uci/网络命令，连跑两次结果一致）
+# 首启 99-custom.sh 的分支参数化用例（audit T3）：4 口 / 1 口 / 0 口三条分支
+# 都必须真的执行过，并且断言"脚本产出的配置"，而不是"自己往库里种的键"。
+# 旧用例在无 /sys 的宿主上只走了 count=0 的 else 分支，还自种自验（恒真）。
 set -u
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-S="$ROOT/files/etc/uci-defaults/99-custom.sh"
-mkdir -p /tmp/ud-bin
-cp "$ROOT/shell/tests/run-uci" /tmp/ud-bin/uci
-cp "$ROOT/shell/tests/lib-uci-stub.sh" /tmp/ud-bin/lib-uci-stub.sh
-chmod +x /tmp/ud-bin/uci
-# 桩掉特权命令，避免测试触碰宿主系统
-for c in growpart resize2fs ethtool swapctl logger; do
-	printf '#!/bin/sh\nexit 0\n' >"/tmp/ud-bin/$c"
-	chmod +x "/tmp/ud-bin/$c"
-done
-export UCI_STUB_DB=/tmp/ud.db
-FAIL=0
+. "$(dirname "$0")/lib-assert.sh"
+. "$(dirname "$0")/lib-sandbox.sh"
 
-run_once() {
-	: >"$UCI_STUB_DB"
-	cat >>"$UCI_STUB_DB" <<DB
-network.lan.ipaddr=192.168.100.1
-network.wan.auto=1
-DB
-	mkdir -p /tmp/ud-root
-	PATH=/tmp/ud-bin:$PATH sh "$S" >/dev/null 2>&1
-	# 输出稳定化的关键字段
-	sed -n 's/^network\.lan\.ipaddr=//p' "$UCI_STUB_DB" | tail -1
-	sed -n 's/^network\.wan\.auto=//p' "$UCI_STUB_DB" | tail -1
-	sed -n 's/^system\.@system\[0\]\.hostname=//p' "$UCI_STUB_DB" | tail -1
+NETLOG=''
+
+run_ud() { # <tag> [sysfs 规格...]
+	_tag=$1
+	shift
+	sb_new "ud-$_tag"
+	sb_fixture net-anon
+	sb_netports
+	sb_initd
+	SB_SYS=$(sb_sysfs "$@")
+	export NETPORTS_SYSFS=$SB_SYS
+	SB_C=$(sb_script "$REPO/files/etc/uci-defaults/99-custom.sh" etc/uci-defaults/99-custom.sh)
+	SB_NET=$UCI_STUB_DIR/network
+	SB_LOG=$SB_ROOT/etc/config/uci-defaults-log.txt
+	NETLOG=$SB_ROOT/netports.log
 }
 
-a=$(run_once); b=$(run_once)
-if [ "$a" = "$b" ]; then echo "ok: 两次执行结果一致"; else echo "FAIL: 幂等性破坏"; echo "1:$a"; echo "2:$b"; FAIL=1; fi
+run_ud four eth0:0000:01:00.0 eth1:0000:02:00.0 eth2:0000:03:00.0 eth3:0000:04:00.0
+echo "== 4 口：多口分支 =="
+rc=0
+NETPORTS_LOG=$NETLOG sh "$SB_C" >/dev/null 2>&1 || rc=$?
+eq "4 口退出 0" '0' "$rc"
+eq "4 口桥成员" 'eth1 eth2 eth3' "$(uci -q get network.@device[0].ports)"
+contains "4 口日志是多口分支" 'multi-port' "$(cat "$SB_LOG" 2>/dev/null)"
+not_contains "4 口不应报单口告警" 'WARN: single-port' "$(cat "$SB_LOG" 2>/dev/null)"
+# 幂等：连跑两次逐字节一致
+before=$(cksum <"$SB_NET")
+rc=0
+NETPORTS_LOG=$NETLOG sh "$SB_C" >/dev/null 2>&1 || rc=$?
+eq "重复执行退出 0" '0' "$rc"
+eq "重复执行配置逐字节未变" "$before" "$(cksum <"$SB_NET")"
 
-case "$a" in
-	*192.168.100.1*) echo "ok: 管理地址写入" ;;
-	*) echo "FAIL: 管理地址未写入"; FAIL=1 ;;
-esac
-case "$a" in
-	*"0"*) echo "ok: WAN 保持 auto=0" ;;
-	*) echo "FAIL: WAN 未保持关闭"; FAIL=1 ;;
-esac
-case "$a" in
-	*ImmortalWrt*) echo "ok: hostname 写入" ;;
-	*) echo "FAIL: hostname 未写入"; FAIL=1 ;;
-esac
+run_ud one eth0:0000:01:00.0
+echo "== 1 口：单口分支必须保持 LAN 静态（backlog C3）=="
+rc=0
+NETPORTS_LOG=$NETLOG sh "$SB_C" >/dev/null 2>&1 || rc=$?
+eq "1 口退出 0" '0' "$rc"
+eq "单口不把 LAN 切成 DHCP 客户端" 'static' "$(uci -q get network.lan.proto)"
+contains "单口有明确告警" 'WARN: single-port' "$(cat "$SB_LOG" 2>/dev/null)"
+eq "单口管理地址仍写入" '192.168.100.1' "$(uci -q get network.lan.ipaddr)"
+eq "单口不改动出厂桥成员" 'eth0' "$(uci -q get network.@device[0].ports)"
+eq "单口设置 dhcp.lan.ignore 属可选路径（此处应未设置）" '' "$(uci -q get dhcp.lan.ignore)"
 
-# 自定义管理地址覆盖
-: >"$UCI_STUB_DB"; echo "network.lan.ipaddr=192.168.100.1" >>"$UCI_STUB_DB"
-mkdir -p /tmp/ud-etc
-PATH=/tmp/ud-bin:$PATH sh -c "sed 's#/etc/config/custom_router_ip.txt#/tmp/ud-ip.txt#' '$S'" >/dev/null 2>&1 || true
-echo "192.168.50.1" >/tmp/ud-ip.txt
-# 该分支仅在文件存在时生效；此处只验证脚本不因缺失/存在而报错
-if sh -n "$S"; then echo "ok: 脚本语法稳定"; else echo "FAIL: 语法错误"; FAIL=1; fi
+run_ud zero
+echo "== 0 口：无物理口分支 =="
+rc=0
+NETPORTS_LOG=$NETLOG sh "$SB_C" >/dev/null 2>&1 || rc=$?
+eq "0 口退出 0" '0' "$rc"
+contains "0 口有明确告警" '未发现物理网口' "$(cat "$SB_LOG" 2>/dev/null)"
+eq "0 口不写管理地址（沿用出厂）" '192.168.1.1' "$(uci -q get network.lan.ipaddr)"
+eq "0 口不改动桥成员" 'eth0' "$(uci -q get network.@device[0].ports)"
+eq "0 口主机名仍写入" 'ImmortalWrt' "$(uci -q get system.@system[0].hostname)"
 
-[ "$FAIL" = "0" ] && echo "UCI-DEFAULTS OK" || echo "UCI-DEFAULTS FAILED"
-exit $FAIL
+finish UCI-DEFAULTS

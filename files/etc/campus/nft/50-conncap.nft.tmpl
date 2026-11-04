@@ -1,0 +1,34 @@
+# /etc/campus/nft/50-conncap.nft.tmpl —— 防检测二档（默认关）：并发连接上限
+# 本文件是模板；fw4 收录的是 render.sh 渲染出的 50-conncap.nft。只含规则行。
+# 规则数：1 条。
+# 计数约定：文件内该标记（含下方“真机验证”里的 grep 示例）出现次数 = 规则数 + 1。
+#
+# 预期生效方式：
+#   config include 'campus_conncap'
+#       option type 'nftables'
+#       option path '/etc/campus/nft/50-conncap.nft'
+#       option position 'chain-append'
+#       option chain 'mangle_forward'
+#       option enabled '0'      # 二档默认关
+#   → 片段被 include 进 table inet fw4 的 mangle_forward 链尾部（type filter hook forward priority mangle）。
+#   为什么不用 forward 链：fw4 的 forward 链里 zone-jump 会把 lan→wan 流量 jump 到
+#   forward_<zone>，那边 accept 后整条链就结束，chain-append 在 forward 末尾的规则
+#   **永远收不到转发的包**（ruleset.uc:150-151）。mangle_forward 是独立的 hook 链，
+#   没有 zone-jump，追加的规则必然命中。
+#   `ct count over 400` 按"同一来源"的并发 conntrack 条目计数（内核 nf_conncount，
+#   需 kmod 里编译了 conncount 支持），超过即 drop 新建连接。
+#
+# 待真机验证（本机无 nft，未实测）：
+#   ⚠ 语法与计键语义（同源 IP？同 tuple？）需在 25.12.2 上确认；
+#     若内核缺 nf_conncount，fw4 reload 会报错，届时保持 enabled='0' 即可恢复。
+#   开启：uci set firewall.campus_conncap.enabled='1'; uci commit firewall; fw4 reload
+#   验证：
+#     nft list chain inet fw4 mangle_forward | grep -c '!campus'                 # 期望 1
+#     nft list chain inet fw4 mangle_forward | grep 'conn cap'                   # 看 packets 计数
+#     cat /proc/sys/net/netfilter/nf_conntrack_count                      # 对照峰值
+#   回滚：uci set firewall.campus_conncap.enabled='0'; uci commit firewall; fw4 reload
+#
+# 副作用：BT/PT、多标签页、多设备备份/同步会误伤，用户体感是"网变卡"；
+#   限流本身也可能成为新的上行特征。故默认关；阈值 400 只是起点，需按现场实测调整。
+#
+meta nfproto ipv4 oifname "@WAN@" ct state new ct count over 400 counter drop comment "!campus: conn cap"

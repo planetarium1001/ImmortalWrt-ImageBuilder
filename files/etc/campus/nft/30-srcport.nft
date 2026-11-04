@@ -1,0 +1,34 @@
+# /etc/campus/nft/30-srcport.nft —— 防检测二档（默认关）：NAT 源端口随机化
+# 静态文件，无占位符，不需要 render.sh 渲染。只含规则行。
+# 规则数：1 条。
+# 计数约定：文件内该标记（含下方“真机验证”里的 grep 示例）出现次数 = 规则数 + 1。
+#
+# 预期生效方式：
+#   config include 'campus_natport'
+#       option type 'nftables'
+#       option path '/etc/campus/nft/30-srcport.nft'
+#       option position 'chain-prepend'
+#       option chain 'srcnat_wan'
+#       option enabled '0'      # 二档默认关，用户显式开启
+#   → 片段被 include 进 table inet fw4 的 srcnat_wan 链（wan zone 的源 NAT 链）开头。
+#   用 chain-prepend 是为了让本规则先于 fw4 自己生成的裸 masquerade
+#   （zone-masq.uc：`meta nfproto ipv4 ... masquerade`）执行；随后那条 masquerade
+#   落在已做过 NAT 的报文上，预期被忽略。
+#   srcnat_wan 链本身已按 wan zone 出接口限定范围，故这里不需要 oifname。
+#   若 wan zone 没有 masq/snat，fw4 不会生成 srcnat_wan 链，本片段将无法插入
+#   （只 warn，不会炸防火墙），开启前先确认该链存在。
+#
+# 待真机验证（本机无 nft，未实测）：
+#   ⚠ 二次 masquerade 行为未验证：内核把第二条 masquerade 判为冲突时可能直接影响出网。
+#     开启前请在无流量时段操作，并准备回滚。
+#   开启：uci set firewall.campus_natport.enabled='1'; uci commit firewall; fw4 reload
+#   回滚：uci set firewall.campus_natport.enabled='0'; uci commit firewall; fw4 reload
+#   验证：
+#     nft list chain inet fw4 srcnat_wan | grep -c '!campus'   # 期望 1
+#     conntrack -L | grep SNAT    # 源端口分布应离散，不再按 tuple 近序分配
+#     tcpdump -ni <wan> 'tcp[tcpflags] & tcp-syn != 0'         # SYN 源端口无递增序列
+#
+# 副作用：端口预测类应用（部分游戏联机、SIP/RTP、UPnP 映射）可能失效；
+#   限流/随机化本身也可能成为新的特征。故默认关。
+#
+meta nfproto ipv4 meta l4proto { tcp, udp } counter masquerade random,fully-random comment "!campus: nat port rand"

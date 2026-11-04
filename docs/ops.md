@@ -5,7 +5,7 @@
 ## 0. 先备份（每次动配置之前）
 
 ```sh
-sysupgrade -b /tmp/cfg-$(date +%F).tar.gz     # OpenWrt 标准配置备份（含 /etc/config、/etc/firewall.user）
+sysupgrade -b /tmp/cfg-$(date +%F).tar.gz     # 标准配置备份（/etc/config 与 /etc/sysupgrade.conf 登记的文件）
 # 在电脑上取回：
 scp root@192.168.100.1:/tmp/cfg-*.tar.gz .
 ```
@@ -16,6 +16,18 @@ scp root@192.168.100.1:/tmp/cfg-*.tar.gz .
 cp -a /etc/config/network /etc/config/network.bak
 uci revert network dhcp firewall
 ```
+
+## 0.5 场景切换（家 / 校）
+
+```sh
+netprofile status     # 看当前在哪套、每个受管键的实际值
+netprofile home       # 回家：关防检测、IPv6 走上游默认、停用锐捷认证
+netprofile            # 回 campus（默认）：NAT66 + 防检测 + 认证自启
+```
+
+两套配置各自记住你手改的受管键，切走再切回不丢；完整语义、防检测二档项的开启方法与真机实测步骤见[双 profile 手册](profile.md)。
+
+> 本固件不含 `owut`。`owut upgrade` 会用服务器重建的镜像覆盖系统，那个镜像**不带**本仓库的 `netprofile`、`nicsync`、minieap init 与防检测片段（`sysupgrade` 只保留 `/etc` 配置），升级后会出现「后台能进、认证不自启、防检测消失」。要升级请重跑 GitHub Actions 重新构建刷机。
 
 ## 1. 认证与地址（minieap 原生配置）
 

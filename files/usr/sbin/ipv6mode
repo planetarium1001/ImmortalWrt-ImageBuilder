@@ -1,155 +1,130 @@
 #!/bin/sh
-# ipv6mode —— IPv6 三态开关，带每模式记忆
+# ipv6mode —— 兼容壳（deprecated）：IPv6 维度已并入 netprofile，本脚本只做映射转发
 #
-#   nat66   上级只给单地址、不给 PD 时用：内网 ULA + WAN 出口 masq6
-#   native  家宽正常下发 PD 时用：内网直接分配上级前缀，不做 NAT66
-#   off     完全关闭内网 IPv6
+# 用法：ipv6mode [nat66|native|off|status|forget <mode>]
 #
-# 用法：ipv6mode [nat66|native|off|status|forget]
+#   nat66   → netprofile campus   （campus 模板：ula_prefix=fd7a:6e64:6c35::/48、
+#                                   wan6.auto='1'、wan6.reqprefix='no'、masq6=1）
+#   native  → netprofile home     （home 模板：不做 NAT66，不写 ULA 与 masq6）
+#   off     → 在当前 profile 上关掉内网 IPv6（wan6.auto=0、ra/dhcpv6 disabled、
+#            删掉 ula_prefix 与 masq6）。off 不写任何存档，并清掉 profile 标记：
+#            下次 netprofile <档> 会整档重套该档（存档/模板），off 不会被"记住"。
+#   status  → netprofile status
+#   forget  → netprofile forget <campus|home>（nat66→campus、native→home）
 #
-# 记忆：切换前把当前模式受管的 8 个键存到 /etc/config/ipv6mode.d/<模式>.state，
-# 切回该模式时优先恢复存档；没有存档才套模板。因此每个模式各自记住你的调整。
-# 受管键之外的任何配置都不会被本脚本碰。
+# 旧的 /etc/config/ipv6mode.d/*.state 与 /etc/config/ipv6mode 状态文件已废弃，
+# 不再读写；检测到旧存档时只提示一次人工处理方式。
+#
+# 为什么要这么改：原实现 nat66 把 network.wan6.auto 置 0（netifd 里它是 autostart），
+# WAN 侧根本没有 IPv6，masq6 无源可 NAT。修正在 netprofile 的模板里
+# （campus: wan6.auto='1'），本脚本不再自己持有模板。
 
-ULA='fd7a:6e64:6c35::/48'
-STATE_DIR=/etc/config/ipv6mode.d
-CUR_FILE=/etc/config/ipv6mode
+NETPROFILE=/usr/sbin/netprofile
+CUR_FILE=/etc/netprofile
+LEGACY_DIR=/etc/config/ipv6mode.d
+LEGACY_STATE=/etc/config/ipv6mode
 
-# 受管的键（其余一律不碰）
-KEYS="network.globals.ula_prefix network.wan6.auto network.wan6.proto \
-dhcp.lan.ra dhcp.lan.dhcpv6 dhcp.lan.ndp dhcp.lan.ra_flags"
+usage() {
+	cat <<'EOF'
+用法: ipv6mode [nat66|native|off|status|forget <mode>]
+  nat66   等价 netprofile campus（NAT66：ULA + masq6=1）
+  native  等价 netprofile home
+  off     在当前 profile 上关闭内网 IPv6（不单独存档）
+  status  等价 netprofile status
+  forget  <nat66|native> 删除对应 profile 存档
+（ipv6mode 已并入 netprofile，新配置请直接用 netprofile）
+EOF
+}
 
-# WAN 区域名运行时解析，避免依赖 @zone[N] 索引（索引在用户改过防火墙后会变）
+# 旧存档废弃提示（只在旧文件存在时提示，不自动迁移：旧存档缺少新受管键，
+# 半套迁移比不迁移更容易出事）
+legacy_note() {
+	if [ -f "$LEGACY_STATE" ] || [ -d "$LEGACY_DIR" ]; then
+		printf 'ipv6mode: 旧存档 %s / %s 已废弃，不再读取；如需保留旧手改，请先 uci 设置再执行 netprofile campus|home\n' \
+			"$LEGACY_DIR" "$LEGACY_STATE" >&2
+	fi
+}
+
+# WAN 区域段名运行时解析（与 netprofile 同一纪律：解析不到就报错，不猜 @zone[N]）
 wanzone() {
-	for sec in $(uci -q show firewall 2>/dev/null | sed -n 's/^\(firewall\.[^.=]*\)\.name=.*/\1/p'); do
-		v=$(uci -q get "$sec.name" 2>/dev/null | tr -d "'\"")
-		[ "$v" = "wan" ] && { echo "${sec#firewall.}"; return; }
+	for _sec in $(uci -q show firewall 2>/dev/null | sed -n 's/^\(firewall\.[^.=]*\)\.name=.*/\1/p'); do
+		_zn=$(uci -q get "$_sec.name" 2>/dev/null | tr -d "'\"")
+		if [ "$_zn" = 'wan' ]; then
+			printf '%s' "${_sec#firewall.}"
+			return 0
+		fi
 	done
-	echo "@zone[1]"
+	return 1
 }
 
-keys_all() {
-	for k in $KEYS; do echo "$k"; done
-	echo "firewall.$(wanzone).masq6"
+# 关闭内网 IPv6：只动 IPv6 维度这几个受管键，其余配置不碰
+ipv6_off() {
+	if ! _zone=$(wanzone) || [ -z "$_zone" ]; then
+		printf 'ipv6mode: ERROR: firewall 里找不到 name=wan 的 zone，无法定位 masq6（不猜 @zone[N]）\n' >&2
+		exit 3
+	fi
+	uci set network.wan6.proto='dhcpv6'
+	uci set network.wan6.auto='0'
+	uci -q delete network.wan6.reqprefix
+	uci -q delete network.globals.ula_prefix
+	uci set dhcp.lan.ra='disabled'
+	uci set dhcp.lan.dhcpv6='disabled'
+	uci -q delete dhcp.lan.ra_flags
+	uci -q delete "firewall.$_zone.masq6"
+	uci commit network
+	uci commit dhcp
+	uci commit firewall
+	/etc/init.d/network reload || exit 1
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || :
+	/etc/init.d/firewall reload || exit 1
+	# off 不是 profile：清掉 profile 标记，避免下一次切换把 off 的键值当成该档的"手改记忆"
+	rm -f "$CUR_FILE"
+	printf 'ipv6mode: 已在当前配置上关闭内网 IPv6（不存档、已清除 profile 标记；下次 netprofile campus|home 会整档重套）\n'
 }
 
-save_state() {
-	_mode=$1
-	mkdir -p "$STATE_DIR" 2>/dev/null
-	_f="$STATE_DIR/$_mode.state"
-	: >"$_f"
-	for k in $(keys_all); do
-		v=$(uci -q get "$k" 2>/dev/null)
-		case "$k" in
-			dhcp.lan.ra_flags)
-				v=$(echo "$v" | tr ' ' ',')
-				;;
-		esac
-		[ -n "$v" ] || v='-'
-		echo "$k=$v" >>"$_f"
-	done
-}
-
-restore_state() {
-	_f="$STATE_DIR/$1.state"
-	[ -f "$_f" ] || return 1
-	while IFS= read -r line; do
-		[ -n "$line" ] || continue
-		k=${line%%=*}; v=${line#*=}
-		[ -n "$k" ] || continue
-		case "$k" in
-			dhcp.lan.ra_flags)
-				uci -q delete "$k"
-				[ "$v" = "-" ] && continue
-				for item in $(echo "$v" | tr ',' ' '); do uci add_list "$k=$item"; done
-				;;
-			*)
-				if [ "$v" = "-" ]; then uci -q delete "$k"; else uci set "$k=$v"; fi
-				;;
-		esac
-	done <"$_f"
-	return 0
-}
-
-apply_default() {
-	case "$1" in
-		nat66)
-			uci set network.globals.ula_prefix="$ULA"
-			uci set network.wan6.auto='0'
-			uci set network.wan6.proto='dhcpv6'
-			uci set dhcp.lan.ra='server'
-			uci set dhcp.lan.dhcpv6='server'
-			uci set dhcp.lan.ndp='disabled'
-			uci -q delete dhcp.lan.ra_flags
-			uci add_list dhcp.lan.ra_flags='managed-config'
-			uci add_list dhcp.lan.ra_flags='other-config'
-			uci set "firewall.$(wanzone).masq6=1"
-			;;
-		native)
-			uci -q delete network.globals.ula_prefix
-			uci set network.wan6.auto='1'
-			uci set network.wan6.proto='dhcpv6'
-			uci set dhcp.lan.ra='server'
-			uci set dhcp.lan.dhcpv6='server'
-			uci set dhcp.lan.ndp='disabled'
-			uci -q delete dhcp.lan.ra_flags
-			uci add_list dhcp.lan.ra_flags='managed-config'
-			uci add_list dhcp.lan.ra_flags='other-config'
-			uci -q delete "firewall.$(wanzone).masq6"
-			;;
-		off)
-			uci -q delete network.globals.ula_prefix
-			uci set network.wan6.auto='0'
-			uci set network.wan6.proto='dhcpv6'
-			uci set dhcp.lan.ra='disabled'
-			uci set dhcp.lan.dhcpv6='disabled'
-			uci -q delete "firewall.$(wanzone).masq6"
-			;;
-	esac
-}
-
-reload_all() {
-	uci commit network; uci commit dhcp; uci commit firewall
-	/etc/init.d/network reload >/dev/null 2>&1
-	/etc/init.d/dnsmasq restart >/dev/null 2>&1
-	/etc/init.d/firewall reload >/dev/null 2>&1
-}
-
-cur=$(cat "$CUR_FILE" 2>/dev/null)
+legacy_note
 
 case "$1" in
-	nat66|native|off)
-		target=$1
-		[ "$cur" = "$target" ] && { echo "ipv6 已是 $target（如需重置模板用 forget $target）"; exit 0; }
-		[ -n "$cur" ] && save_state "$cur" && echo "已保存 $cur 的当前设置"
-		if restore_state "$target"; then
-			echo "已恢复 $target 上次的调整"
-		else
-			apply_default "$target"
-			echo "已套用 $target 默认模板"
-		fi
-		echo "$target" >"$CUR_FILE"
-		reload_all
-		echo "ipv6 mode -> $target"
+nat66)
+	[ -x "$NETPROFILE" ] || { printf 'ipv6mode: ERROR: 缺 %s\n' "$NETPROFILE" >&2; exit 1; }
+	exec "$NETPROFILE" campus
+	;;
+native)
+	[ -x "$NETPROFILE" ] || { printf 'ipv6mode: ERROR: 缺 %s\n' "$NETPROFILE" >&2; exit 1; }
+	exec "$NETPROFILE" home
+	;;
+off)
+	ipv6_off
+	;;
+status)
+	[ -x "$NETPROFILE" ] || { printf 'ipv6mode: ERROR: 缺 %s\n' "$NETPROFILE" >&2; exit 1; }
+	exec "$NETPROFILE" status
+	;;
+forget)
+	case "${2:-}" in
+	nat66 | campus)
+		[ -x "$NETPROFILE" ] || { printf 'ipv6mode: ERROR: 缺 %s\n' "$NETPROFILE" >&2; exit 1; }
+		exec "$NETPROFILE" forget campus
 		;;
-	status)
-		echo "当前模式: ${cur:-未设置}"
-		for k in $(keys_all); do
-			v=$(uci -q get "$k" 2>/dev/null)
-			printf '  %-32s %s\n' "$k" "${v:-(未设置)}"
-		done
-		echo "存档:"
-		for f in "$STATE_DIR"/*.state; do
-			[ -f "$f" ] && echo "  $(basename "$f" .state)"
-		done
+	native | home)
+		[ -x "$NETPROFILE" ] || { printf 'ipv6mode: ERROR: 缺 %s\n' "$NETPROFILE" >&2; exit 1; }
+		exec "$NETPROFILE" forget home
 		;;
-	forget)
-		[ -z "$1" ] && { echo "usage: ipv6mode forget <mode>" >&2; exit 2; }
-		rm -f "$STATE_DIR/$2.state"
-		echo "已删除 $2 的存档，下次切回将用默认模板"
+	off)
+		printf 'ipv6mode: off 不单独存档（IPv6 维度已并入 profile 存档）\n'
 		;;
 	*)
-		echo "usage: ipv6mode nat66|native|off|status|forget <mode>" >&2
+		usage >&2
 		exit 2
 		;;
+	esac
+	;;
+help | -h | --help)
+	usage
+	;;
+*)
+	usage >&2
+	exit 2
+	;;
 esac
+exit 0

@@ -40,20 +40,24 @@ done
 
 ### 顺序不符时改口（一分钟）
 
+25.12 出厂的内网桥是**匿名 `config device` 段**（只有 `option name 'br-lan'`），并不存在 `network.br_lan` 段——对它 `add_list` 会直接报 `Invalid argument` 且不建段。所以改口别手写段名，交给端口分配的单一入口：
+
 ```sh
-# 假设实际面向上级的是 eth2
+nicsync --check        # 只读：对齐返回 0，不齐返回 2，不写任何配置
+nicsync --fix          # 不对齐时写 wan.device / wan6.device / 桥成员，然后 reload
+
+# 手工指定 WAN 口：先写 device，再让 nicsync 对齐桥成员
 uci set network.wan.device='eth2'
 uci set network.wan6.device='eth2'
-uci set network.wan_dev.name='eth2'
-uci del_list network.br_lan.ports='eth2'
-uci add_list network.br_lan.ports='eth0'
 uci commit network
-/etc/init.d/network reload
+nicsync --fix
 ```
 
 ### 首启自检
 
-首启脚本会调用 `/usr/sbin/nicsync`：按 PCI 槽位排序物理口，若与 `eth0` + `eth1..eth3` 不符，就把**真实名字**写进 UCI 并 reload，日志在 `/etc/config/nicsync.log`。它只写名字、不改接口，因此不会造成失联。
+端口分配只有一个实现：`/lib/functions/netports.sh`，首启 `99-custom.sh` 与 `/usr/sbin/nicsync` 都调它。它按 PCI `bus:dev.fn` 的**数值**排序物理口（`eth2` < `eth10`；`0000:9:00.0` < `0000:10:00.0`），先**定位真实的设备段**（匿名 `config device` 也能命中）再写；定位失败就记 ERROR、一个字节都不改、退出非 0（下次开机重试），绝不留下「WAN 口还挂在桥里」的半套配置。首启之后用 `nicsync --check` 只读复核，日志 `/etc/config/nicsync.log`。
+
+家/校两套配置的切换见[双 profile 手册](profile.md)。
 
 ## 3. 内网地址与 DHCP
 

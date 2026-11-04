@@ -1,49 +1,63 @@
 #!/bin/sh
-# ac-2：模拟 sysfs 下 nicsync 把真实名字写进 UCI，且幂等
+# nicsync 行为用例（ac-4/N1/N2）：25.12 真机段形（**匿名** config device）下
+# ① --dry-run/--check 只读、② --fix 写真实设备段并 reload、③ 永不猜 network.br_lan。
+# 旧用例往桩里种 network.br_lan.ports=… —— 那是 25.12 永不出现的段形（audit T2）。
 set -u
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-S="$ROOT/files/usr/sbin/nicsync"
-FAIL=0
+. "$(dirname "$0")/lib-assert.sh"
+. "$(dirname "$0")/lib-sandbox.sh"
 
-mkdir -p /tmp/ns-bin
-cp "$ROOT/shell/tests/run-uci" /tmp/ns-bin/uci
-cp "$ROOT/shell/tests/lib-uci-stub.sh" /tmp/ns-bin/lib-uci-stub.sh
-chmod +x /tmp/ns-bin/uci
-export UCI_STUB_DB=/tmp/ns.db
+sb_new nicsync
+sb_fixture net-anon
+sb_netports
+sb_initd
+S=$(sb_sysfs eth0:0000:01:00.0 eth1:0000:02:00.0 eth2:0000:03:00.0 eth3:0000:04:00.0)
+N=$(sb_script "$REPO/files/usr/sbin/nicsync" usr/sbin/nicsync)
+NET=$UCI_STUB_DIR/network
+reloads() { grep -c '^network reload' "$SB_RELOADS" 2>/dev/null || true; }
 
-# 造 sysfs：四个口，名字故意不是 eth0-3（复现真机情形）
-B=/tmp/ns-sysfs; rm -rf $B; mkdir -p $B/class/net
-mk() { mkdir -p "$B/class/net/$1/device"; printf 'PCI_SLOT_NAME=%s\n' "$3" >"$B/class/net/$1/device/uevent"; }
-mk eth1 0 0000:02:00.0
-mk eth3 0 0000:03:00.0
-mk eth5 0 0000:04:00.0
-mk eth7 0 0000:05:00.0
+echo "== 出厂状态：桥里只有 eth0，而 wan.device 也是 eth0（端口重叠）=="
+eq "出厂桥成员" 'eth0' "$(uci -q get network.@device[0].ports)"
+eq "出厂 wan.device" 'eth0' "$(uci -q get network.wan.device)"
 
-: >"$UCI_STUB_DB"
-cat >>"$UCI_STUB_DB" <<DB
-network.wan.device=eth0
-network.br_lan.ports=eth1 eth2 eth3
-DB
+echo "== --dry-run：只判定不落盘 =="
+before=$(cksum <"$NET")
+out=$(sh "$N" --dry-run --sysfs "$S" 2>&1); rc=$?
+eq "--dry-run 退出 0" '0' "$rc"
+contains "--dry-run 提示将要修" 'would fix' "$out"
+eq "--dry-run 未落盘" "$before" "$(cksum <"$NET")"
+eq "--dry-run 不 reload" '0' "$(reloads)"
 
-out=$(PATH=/tmp/ns-bin:$PATH sh "$S" --sysfs "$B" 2>&1)
-echo "$out"
-case "$out" in
-	*"wan=eth1"*) echo "ok: 选中第一个口为 WAN" ;;
-	*) echo "FAIL: WAN 选择错误"; FAIL=1 ;;
+echo "== --check：不齐返回 2，且绝不写配置 =="
+out=$(sh "$N" --check --sysfs "$S" 2>&1); rc=$?
+eq "--check 不齐退出 2" '2' "$rc"
+contains "--check 报不齐" '不齐' "$out"
+eq "--check 未落盘" "$before" "$(cksum <"$NET")"
+eq "--check 不 reload" '0' "$(reloads)"
+
+echo "== --fix：写进匿名设备段，而不是猜出来的 network.br_lan =="
+out=$(sh "$N" --fix --sysfs "$S" 2>&1); rc=$?
+eq "--fix 退出 0" '0' "$rc"
+eq "--fix 后 @device[0].ports" 'eth1 eth2 eth3' "$(uci -q get network.@device[0].ports)"
+eq "--fix 后 wan.device" 'eth0' "$(uci -q get network.wan.device)"
+eq "--fix 后 wan6.device" 'eth0' "$(uci -q get network.wan6.device)"
+eq "--fix 触发一次 network reload" '1' "$(reloads)"
+uci -q get network.br_lan >/dev/null 2>&1; rc=$?
+ne "未凭空建出 network.br_lan 段" '0' "$rc"
+case " $(uci -q get network.@device[0].ports) " in
+*' eth0 '*) bad "wan.device 不得留在桥成员里" ;;
+*) ok "wan.device 不在桥成员里" ;;
 esac
-[ "$(sed -n 's/^network\.wan\.device=//p' "$UCI_STUB_DB" | tail -1)" = "eth1" ] && echo "ok: UCI wan.device 已写入" || { echo "FAIL: UCI 未更新"; FAIL=1; }
-lan=$(sed -n 's/^network\.br_lan\.ports=//p' "$UCI_STUB_DB" | tail -1)
-case "$lan" in
-	*eth3*eth5*eth7*) echo "ok: br-lan 收到剩余三个口: $lan" ;;
-	*) echo "FAIL: br-lan 端口不对: $lan"; FAIL=1 ;;
-esac
 
-# 幂等：再跑一次不应再改（输出应提示已对齐）
-out2=$(PATH=/tmp/ns-bin:$PATH sh "$S" --sysfs "$B" 2>&1)
-case "$out2" in
-	*"wan=eth1"*) echo "ok: 二次执行幂等" ;;
-	*) echo "FAIL: 幂等性破坏"; FAIL=1 ;;
-esac
+echo "== --check：对齐后返回 0 且不再 reload =="
+out=$(sh "$N" --check --sysfs "$S" 2>&1); rc=$?
+eq "--check 对齐退出 0" '0' "$rc"
+contains "--check 输出已对齐" '配置已对齐' "$out"
+eq "--check 对齐后未新增 reload" '1' "$(reloads)"
 
-[ "$FAIL" = "0" ] && echo "NICSYNC OK" || echo "NICSYNC FAILED"
-exit $FAIL
+echo "== --sysfs 空目录：安全退出 =="
+mkdir -p "$SB_ROOT/empty-sys/class/net"
+out=$(sh "$N" --check --sysfs "$SB_ROOT/empty-sys" 2>&1); rc=$?
+eq "无物理口退出 0" '0' "$rc"
+contains "无物理口有明确提示" 'no physical port' "$out"
+
+finish NICSYNC

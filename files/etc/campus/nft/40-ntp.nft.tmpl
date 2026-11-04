@@ -1,0 +1,35 @@
+# /etc/campus/nft/40-ntp.nft.tmpl —— 防检测二档（默认关）：NTP 外发收敛到本机
+# 本文件是模板；fw4 收录的是 render.sh 渲染出的 40-ntp.nft。只含规则行。
+# 规则数：1 条。
+# 计数约定：文件内该标记（含下方“真机验证”里的 grep 示例）出现次数 = 规则数 + 1。
+#
+# 预期生效方式：
+#   config include 'campus_ntp'
+#       option type 'nftables'
+#       option path '/etc/campus/nft/40-ntp.nft'
+#       option position 'chain-append'
+#       option chain 'dstnat'
+#       option enabled '0'      # 二档默认关
+#   → 片段被 include 进 table inet fw4 的 dstnat 链
+#     （type nat hook prerouting priority dstnat），把 LAN 终端发往任意上游的
+#     udp/123 改投到路由器自己。
+#   用 `redirect to :123`（等价 REDIRECT 语义：改投到路由器本机）而不是 `dnat ip to <网关IP>:123`：
+#   目标地址由内核按入接口本地地址决定，不必把可配置的 LAN IP 写进规则；
+#   免得用户改了管理地址（/etc/config/custom_router_ip.txt）后劫持静默失效。
+#   前置条件：路由器自身要能对外应答 NTP，即 uci set system.ntp.enable_server='1'
+#   （dnsmasq 提供 NTP 服务）+ system.ntp.server 可达；否则终端拿不到时间。
+#
+# 占位符：@LAN_IF@ = LAN 入接口名，由 /etc/campus/nft/render.sh 从 uci
+#   network.lan.device 读取（兜底 br-lan），镜像里不写死。
+#
+# 待真机验证（本机无 nft，未实测）：
+#   开启：uci set firewall.campus_ntp.enabled='1'; uci commit firewall; fw4 reload
+#   验证：
+#     nft list chain inet fw4 dstnat | grep -c '!campus'    # 期望 1
+#     tcpdump -ni <wan> -c 20 'udp port 123'                # 期望 0 包
+#     LAN 终端 ntpq -p / chronyc sources                    # 应指向网关地址
+#
+# 副作用：全网时间取决于路由器（x86 有 RTC 但会长漂）；上游 NTP 不可达时终端
+#   可能拿不到时间，个别硬编码 NTP 的设备会报错。故默认关。
+#
+iifname "@LAN_IF@" meta nfproto ipv4 udp dport 123 counter redirect to :123 comment "!campus: ntp local"

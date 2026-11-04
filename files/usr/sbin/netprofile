@@ -1,0 +1,593 @@
+#!/bin/sh
+# netprofile —— campus（默认，需要认证的接入环境）/ home 双 profile 一键切换，带每 profile 记忆
+#
+# 用法：
+#   netprofile                  等价 netprofile campus
+#   netprofile campus           默认档：NAT66（ULA + masq6）+ 防检测一档 + minieap 启动
+#   netprofile home             家庭：回到上游默认（不做 NAT66，防检测全关），minieap 停用
+#   netprofile status           打印当前 profile、16 个受管键实际值、与模板/存档的差异
+#   netprofile forget <mode>    删除 <mode> 的存档，下次切回该 profile 重新套模板
+#
+# 纪律（硬约束）：
+#   * 只碰下列 16 个受管键，受管键之外的任何配置一律不动（不改整份 uci 文件）。
+#   * 切换前先把「当前 profile 的受管键现值」存成 /etc/netprofile.d/<mode>.state；
+#     切回该 profile 时优先用存档，存档里没有的键用模板补齐。
+#     因此在某个 profile 下手改的受管键，切走再切回仍然在。
+#   * 切换前另留两份兜底：
+#       /etc/netprofile.d/<target>.backup       uci export network dhcp firewall minieap
+#       /etc/netprofile.d/<target>.backup.keys  受管键现值快照（自动回滚用它）
+#     写键/commit/reload 任一步失败 → 用 .backup.keys 还原受管键 + commit + reload，
+#     并以非 0 退出；不静默留半套。
+#   * WAN 区域名运行时按 name='wan' 解析；解析不到直接报错退出，绝不猜 @zone[N]。
+#
+# 存档格式（沿用原 ipv6mode 范式）：每行 key=value，未设置记 '-'，列表项空格分隔；
+# 还原时遇到 '-' 即 uci delete 该键。
+
+ULA='fd7a:6e64:6c35::/48'
+STATE_DIR=/etc/netprofile.d
+CUR_FILE=/etc/netprofile
+MINIEAP_INIT=/etc/init.d/minieap
+MINIEAP_CONF=/etc/minieap.conf
+# 防检测片段渲染脚本（由 campus nft 单元提供）：翻 enabled=1 之前必须先渲染出 *.nft
+NFT_RENDER=/etc/campus/nft/render.sh
+MODES='campus home'
+
+# 受管键（白名单）：10 个固定键 + firewall.<wanzone>.masq6 + 5 个 include 开关 = 16 项
+BASE_KEYS='network.wan.proto network.wan.hostname
+network.wan6.proto network.wan6.auto network.wan6.reqprefix
+network.globals.ula_prefix
+dhcp.lan.ra dhcp.lan.dhcpv6 dhcp.lan.ndp dhcp.lan.ra_flags'
+INCLUDE_SECS='campus_ttl campus_noleak campus_natport campus_ntp campus_conncap'
+# 一档（campus 默认开）；二档三项默认关，用户手改后进存档
+FIRST_TIER='campus_ttl campus_noleak'
+
+usage() {
+	cat <<'EOF'
+用法: netprofile [campus|home|status|forget <mode>]
+  （无参数）            等价 netprofile campus
+  netprofile campus     默认档：NAT66 + 防检测一档 + minieap 启动
+  netprofile home       家庭档：上游默认，不做 NAT66，minieap 停用
+  netprofile status     当前 profile、受管键实际值与模板/存档差异
+  netprofile forget <mode>  丢弃该 profile 的存档（下次套模板）
+
+受管键之外的配置不会被本脚本触碰。
+存档：/etc/netprofile.d/<mode>.state；切换备份：<mode>.backup 与 <mode>.backup.keys
+EOF
+}
+
+err() { printf 'netprofile: %s\n' "$*" >&2; }
+
+# WAN 区域段名运行时解析：按 option name='wan' 找，不依赖 @zone[N] 索引。
+# 找到则输出段名（可能是 cfgXXXX 或 @zone[N]），找不到返回 1（调用方必须报错退出）。
+wanzone() {
+	for _sec in $(uci -q show firewall 2>/dev/null | sed -n 's/^\(firewall\.[^.=]*\)\.name=.*/\1/p'); do
+		_zn=$(uci -q get "$_sec.name" 2>/dev/null | tr -d "'\"")
+		if [ "$_zn" = 'wan' ]; then
+			printf '%s' "${_sec#firewall.}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# 指定 firewall 段是否存在（避免对不存在的 include 段 uci set，造出无类型野段）
+section_exists() {
+	uci -q show firewall 2>/dev/null | grep -q "^firewall\.$1[.=]"
+}
+
+# 16 个受管键（依赖已解析的 ZONE）
+managed_keys() {
+	for _k in $BASE_KEYS; do
+		printf '%s\n' "$_k"
+	done
+	printf 'firewall.%s.masq6\n' "$ZONE"
+	for _s in $INCLUDE_SECS; do
+		printf 'firewall.%s.enabled\n' "$_s"
+	done
+}
+
+# 该键是否在受管白名单内（还原快照时也要守白名单，防止被改坏的快照写到白名单外）
+managed_has() {
+	managed_keys | grep -qxF "$1"
+}
+
+# set_key <key> <value>；value 为 '-' 表示删除该键；ra_flags 是列表
+set_key() {
+	_k=$1
+	_v=$2
+	case "$_k" in
+	*.ra_flags)
+		uci -q delete "$_k"
+		[ "$_v" = '-' ] && return 0
+		for _item in $_v; do
+			uci add_list "$_k=$_item" || return 1
+		done
+		return 0
+		;;
+	esac
+	if [ "$_v" = '-' ]; then
+		uci -q delete "$_k"
+	else
+		uci set "$_k=$_v" || return 1
+	fi
+	return 0
+}
+
+# 模板值（design.md「模板值」表，硬契约）：未列出的键在该 profile 下为 '-'（删除）
+template_value() {
+	case "$1:$2" in
+	campus:network.wan.proto) printf '%s' 'dhcp' ;;
+	campus:network.wan.hostname) printf '%s' '*' ;;
+	campus:network.wan6.proto) printf '%s' 'dhcpv6' ;;
+	campus:network.wan6.auto) printf '%s' '1' ;;
+	campus:network.wan6.reqprefix) printf '%s' 'no' ;;
+	campus:network.globals.ula_prefix) printf '%s' "$ULA" ;;
+	campus:dhcp.lan.ra) printf '%s' 'server' ;;
+	campus:dhcp.lan.dhcpv6) printf '%s' 'server' ;;
+	campus:dhcp.lan.ndp) printf '%s' 'disabled' ;;
+	campus:dhcp.lan.ra_flags) printf '%s' 'managed-config other-config' ;;
+	home:network.wan.proto) printf '%s' 'dhcp' ;;
+	home:network.wan6.proto) printf '%s' 'dhcpv6' ;;
+	home:network.wan6.auto) printf '%s' '1' ;;
+	home:dhcp.lan.ra) printf '%s' 'server' ;;
+	home:dhcp.lan.dhcpv6) printf '%s' 'server' ;;
+	home:dhcp.lan.ndp) printf '%s' 'disabled' ;;
+	*:firewall.*.masq6)
+		# 只有 campus 做 NAT66
+		if [ "$1" = 'campus' ]; then printf '%s' '1'; else printf '%s' '-'; fi
+		;;
+	*:firewall.campus_ttl.enabled | *:firewall.campus_noleak.enabled)
+		# 一档防检测：campus 开、home 关
+		if [ "$1" = 'campus' ]; then printf '%s' '1'; else printf '%s' '0'; fi
+		;;
+	*:firewall.campus_natport.enabled | *:firewall.campus_ntp.enabled | *:firewall.campus_conncap.enabled)
+		# 二档：默认关，用户手改后进存档
+		printf '%s' '0'
+		;;
+	*) printf '%s' '-' ;;
+	esac
+}
+
+# 从 <mode>.state 里取某键的值；文件或键不存在返回 1（注意：'-' 表示「删除」，仍算存在）
+archive_value() {
+	_f=$STATE_DIR/$1.state
+	[ -f "$_f" ] || return 1
+	_av=$(awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$_f" 2>/dev/null)
+	[ -n "$_av" ] || return 1
+	printf '%s' "$_av"
+}
+
+# 期望值 = 存档优先、模板补齐（存档 '-' 即删除）
+expected_value() {
+	if _ev=$(archive_value "$1" "$2"); then
+		printf '%s' "$_ev"
+	else
+		template_value "$1" "$2"
+	fi
+}
+
+# 把受管键现值写成 key=value 快照（存档与回滚快照共用同一格式）
+dump_keys() {
+	_f=$1
+	: >"$_f" || return 1
+	for _k in $(managed_keys); do
+		_v=$(uci -q get "$_k" 2>/dev/null)
+		[ -n "$_v" ] || _v='-'
+		printf '%s=%s\n' "$_k" "$_v" >>"$_f" || return 1
+	done
+	return 0
+}
+
+# 按 key=value 快照还原受管键
+restore_file() {
+	_f=$1
+	[ -f "$_f" ] || return 1
+	while IFS= read -r _line; do
+		case "$_line" in
+		'' | '#'*) continue ;;
+		esac
+		_k=${_line%%=*}
+		_v=${_line#*=}
+		[ -n "$_k" ] || continue
+		managed_has "$_k" || continue
+		set_key "$_k" "$_v" || return 1
+	done <"$_f"
+	return 0
+}
+
+# 设计要求的整份导出备份（人工深度回滚/排障用）；uci 不支持多包导出，逐包追加
+export_backup() {
+	_f=$1
+	_mode=${2:-'?'}
+	_ok=0
+	_old_umask=$(umask)
+	umask 077
+	{
+		printf '# netprofile backup: profile=%s time=%s\n' "$_mode" "$(date '+%F %T')"
+		printf '# 整份 uci 快照，供人工排障；自动回滚用同目录 <mode>.backup.keys\n'
+		for _p in network dhcp firewall minieap; do
+			if uci export "$_p" 2>/dev/null; then
+				_ok=1
+			else
+				printf '# netprofile: uci export %s 失败或无此包\n' "$_p"
+			fi
+		done
+	} >"$_f" 2>/dev/null
+	umask "$_old_umask"
+	[ "$_ok" = '1' ] || return 1
+	return 0
+}
+
+# 渲染防检测片段（把 *.nft.tmpl 里的 @WAN@/@LAN_IF@ 换成真实设备名）。
+# 顺序契约：渲染 → 置 enabled=1 → fw4 reload；渲染失败就不能置 enabled=1，
+# 否则 include 指向不存在/未渲染的文件，fw4 只 warn，规则静默不生效。
+# 返回 1 表示"该视为 apply 失败"，由调用方走 backup 回滚。
+render_nft() {
+	if [ -f "$NFT_RENDER" ]; then
+		sh "$NFT_RENDER" || return 1
+		return 0
+	fi
+	# 脚本缺失：如果 include 段已经存在（说明镜像是带防检测的），就无法安全置位
+	if section_exists 'campus_ttl' || section_exists 'campus_noleak'; then
+		err "ERROR: 缺 $NFT_RENDER，include 段已存在却无法渲染片段"
+		return 1
+	fi
+	err "警告：缺 $NFT_RENDER，且未发现 include 段（镜像未带防检测片段？），跳过渲染"
+	return 0
+}
+
+# 套用目标 profile：模板打底，再用存档覆盖（存档缺失的键自然落回模板）。
+# 分三步，守住"渲染 → enabled → reload"的顺序：
+#   1) 先写 IPv6/NAT66/DHCP 指纹等非 include 开关的受管键
+#   2) campus 渲染片段（失败 → apply 失败，enabled 一个都不置）
+#   3) 再翻 5 个 include 开关
+apply_target() {
+	_mode=$1
+	for _k in $(managed_keys); do
+		case "$_k" in
+		firewall.campus_*.enabled) continue ;;
+		esac
+		_ev=$(expected_value "$_mode" "$_k")
+		set_key "$_k" "$_ev" || return 1
+	done
+	if [ "$_mode" = 'campus' ]; then
+		if ! render_nft; then
+			err 'ERROR: 防检测片段渲染失败，不置 enabled=1（见上一条 campus-nft 报错）'
+			return 1
+		fi
+	fi
+	for _s in $INCLUDE_SECS; do
+		_k=firewall.$_s.enabled
+		# include 段由 98-campus-nft.sh 创建；段不存在时不写，避免造出无类型野段
+		if ! section_exists "$_s"; then
+			case " $FIRST_TIER " in
+			*" $_s "*)
+				if [ "$_mode" = 'campus' ]; then
+					err "ERROR: campus 需要 firewall.${_s} 段但不存在（98-campus-nft.sh 未执行？），按 apply 失败处理"
+					return 1
+				fi
+				;;
+			esac
+			err "警告：firewall.${_s} 段不存在，跳过 ${_k}（该档不需要或片段未安装）"
+			continue
+		fi
+		_ev=$(expected_value "$_mode" "$_k")
+		set_key "$_k" "$_ev" || return 1
+	done
+	return 0
+}
+
+# 当前受管键是否已经等于目标 profile 的期望值（用于幂等短路）
+expected_matches() {
+	for _k in $(managed_keys); do
+		case "$_k" in
+		firewall.campus_*.enabled)
+			_s=${_k#firewall.}
+			_s=${_s%.enabled}
+			section_exists "$_s" || continue
+			;;
+		esac
+		_exp=$(expected_value "$1" "$_k")
+		[ "$_exp" = '-' ] && _exp=''
+		_act=$(uci -q get "$_k" 2>/dev/null)
+		[ "$_act" = "$_exp" ] || return 1
+	done
+	return 0
+}
+
+commit_pkgs() {
+	uci commit network || return 1
+	uci commit dhcp || return 1
+	uci commit firewall || return 1
+	uci -q commit minieap 2>/dev/null || :
+	return 0
+}
+
+# 顺序敏感：network 先、firewall 最后（design 风险条目）
+reload_all() {
+	# --no-reload：首启 uci-defaults 阶段（netifd/fw4 尚未起来）只写配置、不 reload
+	[ "${NO_RELOAD:-0}" = '1' ] && return 0
+	/etc/init.d/network reload || return 1
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 ||
+		err '警告：dnsmasq restart 失败，DHCP/DNS 可能需手动重试'
+	/etc/init.d/odhcpd reload >/dev/null 2>&1 ||
+		err '警告：odhcpd reload 失败，RA/DHCPv6 可能需手动重试'
+	/etc/init.d/firewall reload || return 1
+	return 0
+}
+
+minieap_state() {
+	if [ ! -x "$MINIEAP_INIT" ]; then
+		printf '%s' 'missing'
+		return 0
+	fi
+	if "$MINIEAP_INIT" enabled >/dev/null 2>&1; then
+		printf '%s' 'enabled'
+	else
+		printf '%s' 'disabled'
+	fi
+}
+
+minieap_apply() {
+	case "$1" in
+	campus)
+		if [ ! -x "$MINIEAP_INIT" ]; then
+			printf 'netprofile: 未找到 %s，跳过认证服务（minieap 包未安装？）\n' "$MINIEAP_INIT"
+			return 0
+		fi
+		_u=$(sed -n 's/^[[:space:]]*username[[:space:]]*=[[:space:]]*//p' "$MINIEAP_CONF" 2>/dev/null | head -n1)
+		case "$_u" in
+		'' | example)
+			printf 'netprofile: %s 里 username 为空或为示例值，跳过启动 minieap；先手动跑一次 minieap -w 填账号\n' "$MINIEAP_CONF"
+			return 0
+			;;
+		esac
+		"$MINIEAP_INIT" enable >/dev/null 2>&1 || return 1
+		# 认证进程起不来不回滚整档配置：换档不会修好账号问题，回滚只会更乱；只告警
+		"$MINIEAP_INIT" start >/dev/null 2>&1 ||
+			err '警告：minieap start 失败，认证未起来（查 /etc/minieap.conf 与 logread -e minieap）'
+		;;
+	home)
+		[ -x "$MINIEAP_INIT" ] || return 0
+		"$MINIEAP_INIT" stop >/dev/null 2>&1 || :
+		"$MINIEAP_INIT" disable >/dev/null 2>&1 || return 1
+		;;
+	esac
+	return 0
+}
+
+minieap_restore() {
+	case "$1" in
+	enabled) minieap_apply campus >/dev/null 2>&1 || : ;;
+	disabled) minieap_apply home >/dev/null 2>&1 || : ;;
+	*) : ;;
+	esac
+}
+
+# 失败回滚：只还原受管键（apply 也只改受管键），再 commit + reload
+rollback() {
+	_snap=$1
+	_mprev=$2
+	err "切换失败，开始按受管键快照回滚：$_snap"
+	if ! restore_file "$_snap"; then
+		err "ERROR: 回滚快照不可用，无法自动回滚；请人工执行 netprofile home 或按 $_snap 修 uci"
+		return 1
+	fi
+	commit_pkgs || err 'ERROR: 回滚 commit 失败，请检查 uci status'
+	minieap_restore "$_mprev"
+	reload_all || err '警告：回滚后 reload 未完全成功，建议手动 /etc/init.d/network reload'
+	err "已回滚到切换前状态（profile 文件仍是 $(cat "$CUR_FILE" 2>/dev/null)）"
+}
+
+do_status() {
+	_cur=$(cat "$CUR_FILE" 2>/dev/null)
+	_cur=$(printf '%s' "$_cur" | tr -d ' \t\r\n')
+	_base=${_cur:-campus}
+	if [ -n "$_cur" ]; then
+		printf 'profile: %s  （%s）\n' "$_cur" "$CUR_FILE"
+	else
+		printf 'profile: 未设置  （%s 不存在或为空；模板基准按 campus 显示）\n' "$CUR_FILE"
+	fi
+	if [ -f "$STATE_DIR/$_base.state" ]; then
+		printf '基准: %s 的存档 %s\n' "$_base" "$STATE_DIR/$_base.state"
+	else
+		printf '基准: %s 的模板（无存档）\n' "$_base"
+	fi
+	printf '受管键（%s；实际值 - 表示未设置）:\n' "$(managed_keys | wc -l | tr -d ' ')"
+	for _k in $(managed_keys); do
+		_act=$(uci -q get "$_k" 2>/dev/null)
+		_show=${_act:--}
+		_exp=$(expected_value "$_base" "$_k")
+		_exp_show=$_exp
+		[ "$_exp" = '-' ] && _exp_show='-'
+		_src='模板'
+		archive_value "$_base" "$_k" >/dev/null 2>&1 && _src='存档'
+		if [ "$_exp" = '-' ]; then
+			if [ -z "$_act" ]; then
+				_mark="一致($_src)"
+			else
+				_mark="不同: 期望 $_exp_show ($_src)"
+			fi
+		elif [ "$_act" = "$_exp" ]; then
+			_mark="一致($_src)"
+		else
+			_mark="不同: 期望 $_exp_show ($_src)"
+		fi
+		case "$_k" in
+		firewall.campus_*.enabled)
+			_s=${_k#firewall.}
+			_s=${_s%.enabled}
+			section_exists "$_s" || _mark="缺 firewall.$_s 段（防检测片段未安装）"
+			;;
+		esac
+		printf '  %-32s %-22s %s\n' "$_k" "$_show" "$_mark"
+	done
+	printf '存档:'
+	_any=0
+	for _m in $MODES; do
+		if [ -f "$STATE_DIR/$_m.state" ]; then
+			printf ' %s' "$_m"
+			_any=1
+		fi
+	done
+	[ "$_any" = '0' ] && printf ' （无）'
+	printf '\n备份:'
+	_any=0
+	for _m in $MODES; do
+		if [ -f "$STATE_DIR/$_m.backup" ] || [ -f "$STATE_DIR/$_m.backup.keys" ]; then
+			printf ' %s' "$_m"
+			_any=1
+		fi
+	done
+	[ "$_any" = '0' ] && printf ' （无）'
+	printf '\n'
+}
+
+switch_to() {
+	_target=$1
+	_cur=$(cat "$CUR_FILE" 2>/dev/null)
+	_cur=$(printf '%s' "$_cur" | tr -d ' \t\r\n')
+
+	# 幂等短路：profile 名一致且受管键确实等于该档的存档/模板（内容级判定，
+	# 这样被 ipv6mode off 之类改过的配置会在这里被发现并重套，而不是假装已切换）。
+	# 若 profile 名一致但键有漂移，则「把当前值存成该档存档再套用」——等价于把这次
+	# 手改记进该档（受管键手改本来就是要被记住的，见 usage 里的记忆纪律）。
+	if [ "$_cur" = "$_target" ] && expected_matches "$_target"; then
+		printf 'netprofile: 已是 %s，受管键与存档/模板一致，无需切换\n' "$_target"
+		# 仍要重渲染：WAN 设备名可能在两次调用之间变过（换口/改 device），
+		# 片段里的 oifname 是渲染时写死的；不重渲染就会出现"配置看着对、规则静默失配"。
+		if [ "$_target" = 'campus' ]; then
+			# 只在**产物真的变了**时才 reload，保证纯幂等调用不制造抖动
+			_before=$(cat "$(dirname "$NFT_RENDER")"/*.nft 2>/dev/null | md5sum 2>/dev/null)
+			if render_nft; then
+				_after=$(cat "$(dirname "$NFT_RENDER")"/*.nft 2>/dev/null | md5sum 2>/dev/null)
+				if [ "$_before" != "$_after" ] && [ "$NO_RELOAD" = '0' ]; then
+					/etc/init.d/firewall reload >/dev/null 2>&1 ||
+						err '警告：fw4 reload 失败（片段已重渲染，规则可能未生效）'
+				fi
+			fi
+		fi
+		do_status
+		return 0
+	fi
+
+	mkdir -p "$STATE_DIR" 2>/dev/null || {
+		err "ERROR: 无法创建 $STATE_DIR"
+		return 1
+	}
+
+	_bak=$STATE_DIR/$_target.backup
+	if ! export_backup "$_bak" "$_target"; then
+		err "警告：uci export 不可用，整份备份未生成（自动回滚改用受管键快照）"
+	fi
+	if ! dump_keys "$_bak.keys"; then
+		err "ERROR: 写受管键快照 $_bak.keys 失败，未做任何修改"
+		return 1
+	fi
+	if [ -n "$_cur" ]; then
+		if ! dump_keys "$STATE_DIR/$_cur.state"; then
+			err "ERROR: 保存 $_cur 的存档失败，未做任何修改"
+			return 1
+		fi
+		printf 'netprofile: 已保存 %s 的当前设置到 %s\n' "$_cur" "$STATE_DIR/$_cur.state"
+	fi
+	_mprev=$(minieap_state)
+
+	if ! apply_target "$_target"; then
+		err 'ERROR: 写受管键失败'
+		rollback "$_bak.keys" "$_mprev"
+		return 1
+	fi
+	if ! commit_pkgs; then
+		err 'ERROR: uci commit 失败'
+		rollback "$_bak.keys" "$_mprev"
+		return 1
+	fi
+	if ! minieap_apply "$_target"; then
+		err 'ERROR: minieap 启停失败'
+		rollback "$_bak.keys" "$_mprev"
+		return 1
+	fi
+	if ! reload_all; then
+		err 'ERROR: reload 失败（network/firewall）'
+		rollback "$_bak.keys" "$_mprev"
+		return 1
+	fi
+	if ! printf '%s\n' "$_target" >"$CUR_FILE.tmp" || ! mv -f "$CUR_FILE.tmp" "$CUR_FILE"; then
+		err "ERROR: 写 $CUR_FILE 失败（配置已切换，标记未更新；下次切换会以未设置起步）"
+		rm -f "$CUR_FILE.tmp" 2>/dev/null
+		return 1
+	fi
+	printf 'netprofile: 已切换到 %s\n' "$_target"
+	do_status
+	return 0
+}
+
+# ---- 主流程 ----
+NO_RELOAD=0
+if [ "${1:-}" = '--no-reload' ]; then
+	NO_RELOAD=1
+	shift
+fi
+cmd=${1:-campus}
+
+case "$cmd" in
+forget)
+	_m=${2:-}
+	case "$_m" in
+	campus | home) ;;
+	*)
+		usage >&2
+		exit 2
+		;;
+	esac
+	rm -f "$STATE_DIR/$_m.state"
+	# 当前就在这一档时，光删存档没用：下次切换会把现值重新 dump 回该档存档。
+	# 所以这里立即按模板重写受管键，让 forget 立刻可见。
+	_cur=$(printf '%s' "$(cat "$CUR_FILE" 2>/dev/null)" | tr -d ' \t\r\n')
+	if [ "$_cur" = "$_m" ]; then
+		if ! ZONE=$(wanzone) || [ -z "$ZONE" ]; then
+			err 'ERROR: firewall 里找不到 name=wan 的 zone，无法定位 masq6（不猜 @zone[N]）'
+			exit 3
+		fi
+		printf 'netprofile: 已删除 %s 的存档；当前就在 %s，立即按模板重写受管键\n' "$_m" "$_m"
+		_bak=$STATE_DIR/$_m.backup
+		export_backup "$_bak" "$_m" || err '警告：uci export 不可用，整份备份未生成（回滚改用受管键快照）'
+		if ! dump_keys "$_bak.keys"; then
+			err 'ERROR: 写受管键快照失败，未做任何修改'
+			exit 1
+		fi
+		_mprev=$(minieap_state)
+		if ! apply_target "$_m" || ! commit_pkgs || ! minieap_apply "$_m" || ! reload_all; then
+			err 'ERROR: 重套模板失败，回滚'
+			rollback "$_bak.keys" "$_mprev"
+			exit 1
+		fi
+		printf '%s\n' "$_m" >"$CUR_FILE"
+		exit 0
+	fi
+	printf 'netprofile: 已删除 %s 的存档；下次切回 %s 会重新套模板\n' "$_m" "$_m"
+	exit 0
+	;;
+help | -h | --help)
+	usage
+	exit 0
+	;;
+campus | home | status) ;;
+*)
+	usage >&2
+	exit 2
+	;;
+esac
+
+# 受管键里的 firewall.<wanzone>.masq6 需要真实区域名：解析失败必须报错退出
+if ! ZONE=$(wanzone) || [ -z "$ZONE" ]; then
+	err 'ERROR: firewall 里找不到 name=wan 的 zone，无法定位 masq6；请先修好防火墙配置（不猜 @zone[N]）'
+	exit 3
+fi
+
+case "$cmd" in
+status) do_status ;;
+*) switch_to "$cmd" || exit $? ;;
+esac
+exit 0

@@ -1,0 +1,37 @@
+# /etc/campus/nft/20-noleak.nft.tmpl —— 防检测一档：出向发现协议兜底 drop
+# 本文件是模板；fw4 收录的是 render.sh 渲染出的 20-noleak.nft。只含规则行。
+# 规则数：3 条。
+# 计数约定：文件内该标记（含下方“真机验证”里的 grep 示例）出现次数 = 规则数 + 1。
+#
+# 预期生效方式：
+#   config include 'campus_noleak'
+#       option type 'nftables'
+#       option path '/etc/campus/nft/20-noleak.nft'
+#       option position 'chain-append'
+#       option chain 'mangle_forward'
+#       option enabled '1'      # campus=1 / home=0，由 netprofile 切换
+#   → 片段被 include 进 table inet fw4 的 mangle_forward 链尾部（type filter hook forward priority mangle）。
+#   为什么不用 forward 链：fw4 的 forward 链里 zone-jump 会把 lan→wan 流量 jump 到
+#   forward_<zone>，那边 accept 后整条链就结束，chain-append 在 forward 末尾的规则
+#   **永远收不到转发的包**（ruleset.uc:150-151）。mangle_forward 是独立的 hook 链，
+#   没有 zone-jump，追加的规则必然命中。
+#   作用面：mDNS/SSDP/WS-Discovery/NetBIOS/SMB 这些链路本地协议正常不过路由，
+#   只有在误配中继（mdns-repeater/avahi/igmpproxy/WAN 与 LAN 同桥）时才会出网；
+#   这里是"防误配兜底"，不是主要检测面。
+#
+# 绝不能包含 67/68（DHCP）与 255.255.255.255 广播：
+#   历史实现把 udp dport { 67, 68, ... } 一起 drop，直接砍掉自己的租约续约。
+#   本片段刻意不出现 67/68，真机验证时要用 tcpdump 断言 udp/68 仍有包。
+#
+# 占位符：@WAN@ 由 /etc/campus/nft/render.sh 从 uci 读取真实 WAN 设备名后替换。
+#
+# 真机验证（本机无 nft，未实测）：
+#   nft list chain inet fw4 mangle_forward | grep -c '!campus'     # 期望 3
+#   tcpdump -ni <wan> -c 50 'udp port 5353 or udp port 1900 or udp port 137 or udp port 3702'
+#                                                           # 期望 0 包
+#   tcpdump -ni <wan> -c 20 'udp port 68'                   # 必须仍有包（DHCP 未被误伤）
+#   关闭：uci set firewall.campus_noleak.enabled='0'; uci commit firewall; fw4 reload
+#
+meta nfproto ipv4 oifname "@WAN@" udp dport { 137, 138, 1900, 3702, 5353 } counter drop comment "!campus: no leak udp"
+meta nfproto ipv4 oifname "@WAN@" tcp dport { 139, 445, 5357 } counter drop comment "!campus: no leak smb"
+meta nfproto ipv6 oifname "@WAN@" udp dport { 1900, 3702, 5353 } counter drop comment "!campus: no leak udp6"
