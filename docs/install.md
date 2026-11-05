@@ -196,8 +196,9 @@ cat /etc/config/overlay-setup.log     # 哪一步失败会写在最后几行
 | 日志里的现象 | 含义 | 处理 |
 |---|---|---|
 | `找不到 label=wrt-overlay 的 btrfs 分区` | p3 还没建出来 / 还没重启生效 | 先跑一次 `/usr/sbin/overlay-setup`，再重启 |
-| `sgdisk -e ... 失败` | 缺 `gdisk` 包，或盘上 GPT 损坏 | 确认 `gdisk` 在包清单里；GPT 损坏按 [ops.md](ops.md) 第 5 节救砖 |
-| `p3 设备节点 10s 内未出现` | 内核没感知新分区表（无 udev，只靠 devtmpfs） | 直接 `reboot`：分区已在表里，重启后会自动接着往下走 |
+| `找不到 sgdisk`（`sgdisk: not found`） | **`sgdisk` 与 `gdisk` 是两个不同的包**（gptfdisk 拆成 `gdisk`/`cgdisk`/`sgdisk`/`fixparts`），镜像只装了 `gdisk` | `apk update && apk add sgdisk`，再重跑 `/usr/sbin/overlay-setup`；新版镜像已同时装两个包 |
+| `sgdisk -e ... 失败` | 盘上 GPT 损坏 | 按 [ops.md](ops.md) 第 5 节救砖；确认没有别的工具在改这张表 |
+| `partx` 失败 / `p3 节点尚未出现，需要重启` | 内核没感知新分区表（无 udev，只靠 devtmpfs）；`partx -a` 必须带 `-n <p3>:<p3>`，否则会撞上已挂载的 p1/p2 而整条失败 | 直接 `reboot`：分区已在表里，重启后 `overlay-setup` 会自动接着往下走（再重启一次即就绪） |
 | `根文件系统在整盘设备上` | 刷成了无分区表的镜像 | 换回正常镜像重刷 |
 
 `overlay-setup` 失败时**不会**动 p2 里已有的临时写层，所以系统始终可用；uci-defaults 的语义是「返回非 0 就下次开机重试」，
@@ -205,6 +206,46 @@ cat /etc/config/overlay-setup.log     # 哪一步失败会写在最后几行
 
 > 不要手工 `mkfs.btrfs`/`sgdisk` 去凑 p3：label 必须是 `wrt-overlay`、四个子卷名必须带 `@`，
 > 这些约定写死在 `/etc/config/fstab`（这也是 preinit 唯一认的那一份）。
+
+### 8.2 客户端能连上但没有外网？先看防火墙是否加载成功
+
+如果「路由器自己 ping 得通、LAN/WiFi 客户端却上不了网」，第一件事是确认 fw4 的 ruleset 真的加载了：
+
+```sh
+nft list tables                      # 应当有 table inet fw4
+nft list chain inet fw4 srcnat_wan   # 应当有 masquerade 或 fullcone 规则
+fw4 print >/dev/null                 # 有报错就会打在这里
+```
+
+**看 `srcnat_wan`，不是 `srcnat`**：`srcnat` 里只有一条 `jump srcnat_wan`，真正的出网 NAT 在
+`srcnat_wan`。wan 开了 IPv4 fullcone 时那条规则叫 `fullcone` 而不是 `masquerade`
+（2026-11-05 真机输出：`meta nfproto ipv4 fullcone comment "!fw4: Handle wan IPv4 fullcone NAT srcnat traffic"`）——
+两个名字**见到任一即算恢复**，别只认 `masquerade` 就判定失败。
+
+`table inet fw4` 不存在 = 整份防火墙没加载 ⇒ **没有 NAT**，只有路由器自己能上网；同时 WAN 侧处于无防护状态，尽快修好。
+
+判据再加强：`table inet fw4` 在、`srcnat_wan` 也有规则、客户端仍然上不了网时，看 campus 片段是否真的注入
+（带 counter 说明转发确实在走）：
+
+```sh
+nft list chain inet fw4 mangle_forward | grep campus   # 应看到 ttl/hl 改写与 no leak，且 counter 在涨
+```
+
+已知的一种成因（v25.12.2 首版镜像，已在后续版本修复）：`/etc/config/firewall` 里 `config include` 段的
+`type`/`path`/`position`/`chain` 被写成了带引号的值（`type=''nftables''`），fw4 解析失败后中止整份渲染。
+现场修法（不需要重刷）：
+
+```sh
+for s in campus_ttl campus_noleak campus_natport campus_ntp campus_conncap; do
+	for k in type position chain path enabled; do
+		v=$(uci -q get "firewall.$s.$k") || continue
+		uci set "firewall.$s.$k=$(printf '%s' "$v" | tr -d "\047\042")"
+	done
+done
+uci commit firewall
+/etc/init.d/firewall restart
+nft list chain inet fw4 srcnat_wan | head    # 看到 masquerade 或 fullcone 就恢复了
+```
 
 ## 9. 升级（sysupgrade）
 

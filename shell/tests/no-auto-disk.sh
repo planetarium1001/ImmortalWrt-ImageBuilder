@@ -54,9 +54,11 @@ if [ -f "$O" ]; then
 	fi
 	#只看代码行：注释里写着 "-a 与 -u 互斥" 不算违规
 	code=$(grep -vE '^[[:space:]]*#' "$O")
-	if printf '%s\n' "$code" | grep -qE 'PARTX.*-a "\$DISK_DEV"' &&
+	# 2026-11-05 真机：`partx -a <disk>` 会把整张表重加一遍，撞上已挂载的 p1/p2
+	# 就整条失败、p3 节点建不出来 ⇒ 必须用 `-a -n <p3>:<p3>` 只加 3 号。
+	if printf '%s\n' "$code" | grep -qE 'PARTX" -a -n ' &&
 		! printf '%s\n' "$code" | grep -qE 'partx .*-a .*-u'; then
-		echo "ok: partx 用 -a 单独调用（-a -u 互斥）"
+		echo "ok: partx 用 -a -n <p3>:<p3> 只加该分区（-a 与 -u 不连用）"
 	else
 		echo "FAIL: partx 调用形态不对（-a 与 -u 不能连用）"
 		FAIL=1

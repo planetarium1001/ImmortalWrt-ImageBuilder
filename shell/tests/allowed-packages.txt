@@ -75,6 +75,7 @@ ppp-mod-pppoe
 resize2fs
 rsync
 sfdisk
+sgdisk
 smartmontools
 tcpdump
 tmux

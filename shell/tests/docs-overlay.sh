@@ -98,4 +98,14 @@ for f in "$INSTALL" "$OPS" "$README"; do
 	hasnt "$f" '只读 squashfs 底层，所有写入落到 `/overlay` 分区'
 done
 
+echo "== install.md 覆盖真机踩到的两种首启故障 =="
+has "$INSTALL" 'apk add sgdisk'
+has "$INSTALL" 'table inet fw4'
+has "$INSTALL" 'uci commit firewall'
+# 判据必须指向 srcnat_wan：srcnat 里只有一条 jump；且 wan 开 fullcone 时出网规则
+# 叫 fullcone 不叫 masquerade —— 只认 masquerade 会让人误判成"没修好"（2026-11-05 真机）
+has "$INSTALL" 'nft list chain inet fw4 srcnat_wan'
+hasnt "$INSTALL" 'nft list chain inet fw4 srcnat  #'
+has "$INSTALL" 'fullcone'
+
 finish DOCS-OVERLAY

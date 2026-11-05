@@ -207,7 +207,7 @@ contains "说明保留重试语义" '下次开机重试' "$(cat "$SB_LOG" 2>/dev
 same_list "写操作序列" "$(cat <<EOS
 sgdisk -e $SB/dev/sda
 sgdisk -n 3:0:0 -t 3:8300 -c 3:wrt-overlay $SB/dev/sda
-partx -a $SB/dev/sda
+partx -a -n 3:3 $SB/dev/sda
 mkfs.btrfs -L wrt-overlay -f $SB/dev/sda3
 mount -t btrfs -o subvolid=5,noatime $SB/dev/sda3 $SB/tmp/top
 btrfs subvolume create $SB/tmp/top/@overlay
@@ -221,7 +221,7 @@ sync
 reboot
 EOS
 )" "$(mutating)"
-not_contains "partx 不带 -u（-a -u 互斥）" 'partx -a -u' "$(cat "$FAKE_LOG")"
+not_contains "partx 不整表重加（必须带 -n 3:3）" "partx -a $SB/dev/sda" "$(cat "$FAKE_LOG")"
 contains "日志记下 p3 建好" 'wrt-overlay' "$(cat "$SB_LOG" 2>/dev/null)"
 eq "@data 不做 chattr +C" '0' "$(count '@data' "$STATE/nocow")"
 contains "关键事件进 logread（logger -t overlay-setup）" 'logger -t overlay-setup' "$(cat "$FAKE_LOG")"

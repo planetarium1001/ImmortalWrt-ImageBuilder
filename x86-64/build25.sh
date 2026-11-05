@@ -80,9 +80,12 @@ PACKAGES="$PACKAGES luci-app-diskman luci-app-samba4 luci-app-minidlna luci-app-
 # btrfs 写层（p3 上的 @overlay/@docker/@swap/@data）：
 #   kmod-fs-btrfs 内核无内置 btrfs，必须带模块（preinit 里 modprobe）
 #   btrfs-progs   挂载/子卷/属性命令（btrfs subvolume、property 等）
-#   gdisk         sgdisk -e 把 GPT 备份头挪到盘尾，否则建不出到盘尾的 p3
+#   gdisk / sgdisk  gptfdisk 拆成 4 个独立包（gdisk/cgdisk/sgdisk/fixparts）！
+#                  overlay-setup 调的是 sgdisk（-e 挪 GPT 备份头、-n 建 p3），
+#                  只装 gdisk 会在首启报 "sgdisk: not found"（2026-11-05 真机实证）；
+#                  gdisk 只是留着方便人工排障
 # 这三个包必须写在这里：ImageBuilder 下 imm25.config 的 CONFIG_PACKAGE_* 不生效。
-PACKAGES="$PACKAGES kmod-fs-btrfs btrfs-progs gdisk"
+PACKAGES="$PACKAGES kmod-fs-btrfs btrfs-progs gdisk sgdisk"
 # 说明：不含 ppp/pppoe —— 当前场景用不到，需要时再装
 
 # ============= 代理：nikki（mihomo）==============

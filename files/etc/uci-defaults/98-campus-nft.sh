@@ -34,11 +34,17 @@ add_include() {
 		failed=$((failed + 1))
 		return 1
 	fi
-	uci set "firewall.$_name.type='nftables'"
-	uci set "firewall.$_name.path='$_path'"
-	uci set "firewall.$_name.position='$_pos'"
-	uci set "firewall.$_name.chain='$_chain'"
-	uci set "firewall.$_name.enabled='0'"
+	# 注意：值里**不能**带引号。整行在双引号内，内层单引号会原样写进 UCI，
+	# 得到 type="'nftables'" 这种值 —— fw4 解析 include 类型失败后整份 ruleset
+	# 渲染中止（表现为 NAT/转发全丢，只有路由器自己能上网）。
+	# 2026-11-05 真机实测：config include 的五项全部被引号污染，fw4 报
+	#   "option 'type' specifies invalid value ''nftables''" + "left-hand side
+	#    expression is not an array or object"。改动前务必保持下列写法无内层引号。
+	uci set "firewall.$_name.type=nftables"
+	uci set "firewall.$_name.path=$_path"
+	uci set "firewall.$_name.position=$_pos"
+	uci set "firewall.$_name.chain=$_chain"
+	uci set "firewall.$_name.enabled=0"
 	log "include $_name 创建：type=nftables position=$_pos chain=$_chain path=$_path enabled=0"
 	created=$((created + 1))
 	return 0
