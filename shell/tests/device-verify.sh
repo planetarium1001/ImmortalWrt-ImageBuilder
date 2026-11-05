@@ -20,7 +20,7 @@ pend() {
 
 [ -n "$ROUTER" ] || pend "未设置 ROUTER=<user@host>；真机验收需要一台已刷机的设备"
 # shellcheck disable=SC2086
-ssh $SSHOPT "$ROUTER" true >/dev/null 2>&1 || pend "连不上 $ROUTER（或密钥未授权）"
+ssh $SSHOPT "$ROUTER" true >/dev/null 2>&1 || pend "连不上 ${ROUTER}（或密钥未授权）"
 
 rsh() { # 远程执行，返回远端退出码
 	# shellcheck disable=SC2086
@@ -78,7 +78,9 @@ stage_nikki() {
 stage_overlay() {
 	echo "== ac-11 btrfs 子卷写层 =="
 	chk "btrfs 模块已加载（/proc/filesystems 有 btrfs）" 'grep -qw btrfs /proc/filesystems'
-	chk "/overlay 的 fstype 是 btrfs" '[ "$(awk \'\''$2=="/overlay"{print $3}'\'' /proc/mounts)" = btrfs ]'
+	# 别用 '\'' 这种嵌套引号：macOS 的 sh(bash 3.2) 经 ssh 传到远端会变成未闭合引号
+	# （2026-11-06 实测 ash 报 unterminated quoted string）。统一用 \$ / \" 的惯例写法。
+	chk "/overlay 的 fstype 是 btrfs" 'awk "\$2==\"/overlay\"{exit !(\$3==\"btrfs\")}" /proc/mounts'
 	chk "/overlay 挂的是子卷 @overlay" 'grep -q "subvol=@overlay\|subvolid=" /proc/mounts && btrfs subvolume show /overlay 2>/dev/null | grep -q "Name:.*@overlay\|@overlay"'
 	# 注意：/ 是 overlayfs，df / 与 df /overlay 是同一个 btrfs 池，两者相等恒真（审计点名）。
 	# 改与**整盘**容量比：p3 应占满除 p1(32MiB)+p2(512MiB) 之外的盘尾。
@@ -91,7 +93,9 @@ stage_overlay() {
 	chk "@data 挂在 /data" 'awk "\$2==\"/data\"{f=1} END{exit !f}" /proc/mounts'
 	chk "/opt/docker 与 /swap 根目录带 NOCOW（C）标志" \
 		'lsattr -d /opt/docker 2>/dev/null | grep -q C && lsattr -d /swap 2>/dev/null | grep -q C'
-	chk "swapfile 在 /swap/swapfile 且已启用" 'swapon 2>/dev/null | grep -q "/swap/swapfile"'
+	# 必须用 swapon -s：OpenWrt 的 /usr/sbin/swapon 是指向 /sbin/block 的软链，
+	# 不带参数时只打 usage 并 rc=255（2026-11-06 真机实测）
+	chk "swapfile 在 /swap/swapfile 且已启用" 'swapon -s 2>/dev/null | grep -q "/swap/swapfile"'
 	# 出厂值是 "/opt/docker/"（带尾斜杠），等值比较会假红
 	chk "docker data_root 指向 /opt/docker" \
 		'! command -v dockerd >/dev/null 2>&1 || [ "$(uci -q get dockerd.globals.data_root | sed "s:/*$::")" = /opt/docker ]'

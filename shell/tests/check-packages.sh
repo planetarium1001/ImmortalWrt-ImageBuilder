@@ -43,7 +43,7 @@ for p in minieap parted sfdisk zram-swap kmod-nft-tproxy nikki; do
 	if printf '%s\n' "$pkgs" | grep -qx "$p"; then
 		ok "关键包在权威清单: $p"
 	else
-		bad "关键包缺失: $p（build25.sh 的 PACKAGES 里必须有）"
+		bad "关键包缺失: ${p}（build25.sh 的 PACKAGES 里必须有）"
 	fi
 done
 

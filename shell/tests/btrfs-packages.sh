@@ -56,7 +56,7 @@ printf '%s\n' "$mapping" | while IFS=: read -r bin pkg; do
 		if printf '%s\n' "$pkgs" | grep -qx "$pkg"; then
 			echo "  ok   脚本调用 $bin → PACKAGES 含 $pkg"
 		else
-			echo "  FAIL 脚本调用 $bin，但 PACKAGES 缺 $pkg"
+			echo "  FAIL 脚本调用 ${bin}，但 PACKAGES 缺 $pkg"
 			FAIL=1
 		fi
 	fi

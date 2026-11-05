@@ -111,7 +111,7 @@ setup() { # <用例名> <size_mb>
 	S=$(sb_script "$SWCTL" usr/sbin/swapctl)
 }
 
-run_apply() { # 运行被测脚本，返回退出码（stdout+stderr 收进 $OUT）
+run_apply() { # 运行被测脚本，返回退出码（stdout+stderr 收进 ）
 	rc=0
 	sh "$S" apply >"$OUT" 2>&1 || rc=$?
 	printf '%s' "$rc"

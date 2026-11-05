@@ -137,7 +137,7 @@ start() {
 				log "WARN: swapctl apply 失败（swap 本次未启用；子卷挂载不受影响，详见 /etc/config/overlay-setup.log 与 swapctl 输出）"
 			fi
 		else
-			log "WARN: 找不到 $SWAPCTL，跳过 swap 自启"
+			log "WARN: 找不到 ${SWAPCTL}，跳过 swap 自启"
 		fi
 	else
 		_rc=1

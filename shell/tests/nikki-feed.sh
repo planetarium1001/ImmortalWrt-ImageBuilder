@@ -167,7 +167,7 @@ CASE="7. --strict：源不可达时返回非 0"
 printf '\n[%s]\n' "$CASE"
 IB=$(make_ib_apk strict)
 run env NIKKI_BASE_URL="http://127.0.0.1:1" sh "$SUBJECT" --workdir "$IB" --strict
-if [ "$RC" -ne 0 ]; then ok "退出码非 0"; else no "应当非 0（得到 $RC）"; fi
+if [ "$RC" -ne 0 ]; then ok "退出码非 0"; else no "应当非 0（得到 ${RC}）"; fi
 assert_contains "仍然解释回退原因" "内置 apk" "$OUT"
 
 printf '\n---------------- 结果: %d 通过, %d 失败 ----------------\n' "$PASS" "$FAIL"

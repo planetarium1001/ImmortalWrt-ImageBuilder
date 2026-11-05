@@ -24,7 +24,7 @@ pend() {
 
 [ -n "$ROUTER" ] || pend "未设置 ROUTER=<user@host>；ac-12 需要在已升级的真机上跑"
 # shellcheck disable=SC2086
-ssh $SSHOPT "$ROUTER" true >/dev/null 2>&1 || pend "连不上 $ROUTER（或密钥未授权）"
+ssh $SSHOPT "$ROUTER" true >/dev/null 2>&1 || pend "连不上 ${ROUTER}（或密钥未授权）"
 
 rsh() {
 	# shellcheck disable=SC2086
@@ -45,11 +45,11 @@ echo "== ac-12 升级后 p3 与子卷是否仍在 =="
 chk "机器可执行 btrfs（btrfs-progs 已装）" 'btrfs --version >/dev/null 2>&1'
 chk "存在 label=wrt-overlay 的 btrfs 分区（p3 未被整盘覆写抹掉）" \
 	'btrfs filesystem show wrt-overlay >/dev/null 2>&1'
-chk "/overlay 仍然是 btrfs" '[ "$(awk '\''$2=="/overlay"{print $3}'\'' /proc/mounts)" = btrfs ]'
+chk "/overlay 仍然是 btrfs" 'awk "\$2==\"/overlay\"{exit !(\$3==\"btrfs\")}" /proc/mounts'
 chk "@overlay 子卷仍在" 'btrfs subvolume list /overlay 2>/dev/null | grep -q @overlay'
 chk "@docker 子卷仍在" 'btrfs subvolume list /overlay 2>/dev/null | grep -q @docker'
 chk "@swap 子卷仍在" 'btrfs subvolume list /overlay 2>/dev/null | grep -q @swap'
-chk "@data 子卷仍挂载在 /data" 'awk '\''$2=="/data"{f=1} END{exit !f}'\'' /proc/mounts'
+chk "@data 子卷仍挂载在 /data" 'awk "\$2==\"/data\"{f=1} END{exit !f}" /proc/mounts'
 chk "配置目录来自 p3 写层（/etc/config 可写且非 tmpfs）" \
 	'grep -q " /overlay " /proc/mounts && touch /etc/config/.upgrade-probe && rm -f /etc/config/.upgrade-probe'
 # 只检查**最后一次** overlay-setup 运行：日志是追加的，历史 ERROR（例如首启 chattr 缺失）会永久留着

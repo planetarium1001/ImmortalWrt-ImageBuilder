@@ -261,7 +261,7 @@ else
 	# （gdisk / cgdisk / sgdisk / fixparts），只装 gdisk 会得到 /usr/bin/gdisk
 	# 而没有 sgdisk —— 2026-11-05 真机就是这么失败的。这里给出可行动的报错。
 	have_cmd "$SGDISK" ||
-		die 3 "找不到 $SGDISK（sgdisk 属于独立的 apk 包 sgdisk，不是 gdisk）；先 apk add sgdisk 再重跑"
+		die 3 "找不到 ${SGDISK}（sgdisk 属于独立的 apk 包 sgdisk，不是 gdisk）；先 apk add sgdisk 再重跑"
 	run "$SGDISK" -e "$DISK_DEV" ||
 		die 1 "sgdisk -e $DISK_DEV 失败（无法把 GPT 备份头挪到盘尾）"
 	run "$SGDISK" -n "${P3NUM}:0:0" -t "${P3NUM}:8300" -c "${P3NUM}:$LABEL" "$DISK_DEV" ||
@@ -274,7 +274,7 @@ else
 	if [ "$DRY" = 0 ]; then
 		run "$PARTX" -a -n "${P3NUM}:${P3NUM}" "$DISK_DEV" ||
 			run "$PARTX" -u "${P3NUM}:${P3NUM}" "$DISK_DEV" ||
-			log "WARN: partx 未能让内核感知 p$P3NUM（将靠重启生效）"
+			log "WARN: partx 未能让内核感知 p${P3NUM}（将靠重启生效）"
 		_i=0
 		while [ "$_i" -lt 10 ]; do
 			p3_exists && break
