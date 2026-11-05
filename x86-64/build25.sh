@@ -5,7 +5,7 @@ source shell/apk-custom-packages.sh
 echo "第三方apk软件包: $CUSTOM_PACKAGES"
 LOGFILE="/tmp/uci-defaults-log.txt"
 echo "Starting 99-custom.sh at $(date)" >> $LOGFILE
-echo "编译固件大小为: $PROFILE MB"
+echo "根分区固定 512 MiB（squashfs 只读根；写层在 p3 的 btrfs 子卷 @overlay）"
 echo "Include Docker: $INCLUDE_DOCKER"
 
 # 拨号与认证都不在构建期配置：认证走设备上的 /etc/minieap.conf，
@@ -63,7 +63,10 @@ PACKAGES="$PACKAGES ip-full ethtool-full irqbalance conntrack"
 # 首启扩容依赖：feed 里没有 growpart，用 parted/sfdisk + resize2fs
 # 25.12 把 e2fsprogs 拆成多个包：resize2fs / dumpe2fs / partx-utils 必须单独声明，
 # 否则扩容时"分区扩了、文件系统没扩"，表现为容量不变。
-PACKAGES="$PACKAGES parted sfdisk e2fsprogs fdisk resize2fs dumpe2fs partx-utils blockdev"
+# chattr / lsattr 同样是 25.12 拆出来的独立 apk 包（不在 e2fsprogs 里）：
+# btrfs 子卷靠 `chattr +C` 置 NOCOW（@docker/@swap）并用 `lsattr` 复核，
+# 缺了它们 nodatacow 意图落不了地，swapfile 落在非 NOCOW 文件上 swapon 会直接失败。
+PACKAGES="$PACKAGES parted sfdisk e2fsprogs fdisk resize2fs dumpe2fs partx-utils blockdev chattr lsattr"
 # 内存压缩 swap
 PACKAGES="$PACKAGES zram-swap kmod-zram"
 # 防检测/探测依赖
@@ -74,6 +77,12 @@ PACKAGES="$PACKAGES htop iftop tcpdump iperf3 bind-dig lm-sensors pciutils usbut
 PACKAGES="$PACKAGES luci-app-nlbwmon luci-app-vnstat2 luci-app-statistics luci-app-watchcat luci-app-autoreboot"
 # 存储/共享/容器
 PACKAGES="$PACKAGES luci-app-diskman luci-app-samba4 luci-app-minidlna luci-app-openlist luci-app-hd-idle"
+# btrfs 写层（p3 上的 @overlay/@docker/@swap/@data）：
+#   kmod-fs-btrfs 内核无内置 btrfs，必须带模块（preinit 里 modprobe）
+#   btrfs-progs   挂载/子卷/属性命令（btrfs subvolume、property 等）
+#   gdisk         sgdisk -e 把 GPT 备份头挪到盘尾，否则建不出到盘尾的 p3
+# 这三个包必须写在这里：ImageBuilder 下 imm25.config 的 CONFIG_PACKAGE_* 不生效。
+PACKAGES="$PACKAGES kmod-fs-btrfs btrfs-progs gdisk"
 # 说明：不含 ppp/pppoe —— 当前场景用不到，需要时再装
 
 # ============= 代理：nikki（mihomo）==============
@@ -133,7 +142,10 @@ fi
 echo "$(date '+%Y-%m-%d %H:%M:%S') - Building image with the following packages:"
 echo "$PACKAGES"
 
-make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="/home/build/immortalwrt/files" ROOTFS_PARTSIZE=$PROFILE EXTRA_IMAGE_NAME="n5105"
+# 根分区固定 512 MiB：squashfs payload 实测 159.2 MiB，留 3.2x 余量。
+# 不接受外部改尺寸——改 ROOTFS_PARTSIZE 会让镜像分区表与盘上不一致，
+# sysupgrade 走整盘覆写，p3（@overlay/@docker/@swap/@data）全丢。
+make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="/home/build/immortalwrt/files" ROOTFS_PARTSIZE=512 EXTRA_IMAGE_NAME="n5105"
 
 if [ $? -ne 0 ]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: Build failed!"

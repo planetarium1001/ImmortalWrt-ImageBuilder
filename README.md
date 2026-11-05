@@ -16,7 +16,7 @@
 | 方向 | 改动 |
 |---|---|
 | 目标 | 移除其余 9 个平台目录与全部非 x86-64 workflow，只保留本机型 |
-| 文件系统 | 新增 ext4 根（上游 squashfs 产物并存，实际刷写用 ext4），根分区固定 2G |
+| 文件系统 | squashfs 只读根（根分区固定 512 MiB）+ btrfs 写层：`/overlay` 在系统盘 p3 的 `@overlay` 子卷上，`@docker`/`@swap`/`@data` 各占一个子卷 |
 | 端口 | 首个物理口为 WAN，其余入桥；按 PCI `bus:dev.fn` 数值序判定，不重命名网卡 |
 | 认证 | 内置 minieap（锐捷 v3），campus profile 下自动 `enable` + `start` |
 | 场景切换 | `netprofile`（默认 campus）↔ `netprofile home`，两套配置各自记住手改内容 |
@@ -32,57 +32,53 @@
 3. 填写参数：
    - `luci_version`：`25.12.2`（workflow 默认值即为该版本）
    - `custom_router_ip`：管理地址，默认 `192.168.100.1`
-   - `profile`：`2G`（首启自动扩满整盘）
    - `include_docker`：按需
    - `enable_store`：按需
    - 认证与拨号都不在构建期配置：认证改 `/etc/minieap.conf`，宽带账号改 WAN 的 UCI（见[运维手册](docs/ops.md)）
-4. 从 Release 下载 `immortalwrt-25.12.2-n5105-x86-64-generic-ext4-combined-efi.img.gz`（机型标识在前缀，`ext4-combined-efi` 在尾部）。
+4. 从 Release 下载 `immortalwrt-25.12.2-n5105-x86-64-generic-squashfs-combined-efi.img.gz`（机型标识在前缀，`squashfs-combined-efi` 在尾部）。
 5. 按 [安装手册](docs/install.md) 刷写并进入后台。
 
 ## 构建产物与磁盘布局
 
-每次构建产出两个镜像，按需选一个刷写：
+每次构建只产出一个镜像，直接整盘写入：
 
-| 产物 | 根文件系统 | 可写空间在哪 | 适用场景 |
-|---|---|---|---|
-| `*-ext4-combined-efi.img.gz` | ext4（整盘可写） | 根分区本身 | 推荐，需要自由安装软件、改系统文件 |
-| `*-squashfs-combined-efi.img.gz` | squashfs（只读）+ overlay | `/overlay` 分区 | 需要恢复出厂能力，系统文件不会被改坏 |
+| 产物 | 根文件系统 | 写层在哪 |
+|---|---|---|
+| `*-squashfs-combined-efi.img.gz` | squashfs（只读，固定 512 MiB） | 系统盘 p3 的 btrfs 子卷 `@overlay` |
 
-两者分区布局相同（引导分区 + 根分区），区别只在根分区的文件系统类型。
+写盘后盘上的布局（p3 由**首启**创建，镜像里只有 p1/p2）：
+
+| 分区 | 大小 | 内容 |
+|---|---|---|
+| p1 | 32 MiB | EFI / GRUB 引导 |
+| p2 | 512 MiB | squashfs 根（只读，`/rom`） |
+| p3 | 盘尾全部剩余（128G 盘约 126 GiB） | btrfs，label `wrt-overlay`：`@overlay`→`/overlay`、`@docker`→`/opt/docker`、`@swap`→`/swap`、`@data`→`/data` |
 
 ### `/` 与 `/overlay` 的关系
 
-- **ext4 镜像**：`/` 就是根分区，没有独立的 `/overlay`。扩容扩的是 `/`，`df -h /` 即整盘可用空间。
-- **squashfs 镜像**：`/` 是只读 squashfs 底层，所有写入落到 `/overlay` 分区，由 overlayfs 合并呈现；`df -h /` 显示的其实是 `/overlay` 的容量。
+- `/` 是只读 squashfs 底层 + `@overlay` 写层合并后的视图，所有写入都落到 `@overlay`；
+- 装软件、改 `/etc`、放 docker 层都吃 `@overlay` 的空间，`df -h /overlay` 就是可用容量；
+- p3 建好后**吃满整盘**，所以没有「扩容」这一步：既不需要、也不要手工动分区表
+  （p3 被 resize/move 过，下次升级就会判定布局改变而整盘覆写）。
 
-因此：
-
-- ext4 镜像 → 扩 `/`，扩完 `/` 就是整盘；
-- squashfs 镜像 → 扩 `/overlay`；`/` 只读且 squashfs 不支持在线扩容，不需要、也无法扩。
-
-**扩 `/overlay` 不会让 `/` 不够用。** squashfs 的 `/` 是固定大小的只读基础层，安装的软件与改动全部写入 `/overlay`；判断空间够不够看 `df -h /` 即可。
-
-镜像里的根分区固定 **2G**，固件不再自动扩容。需要更大空间时手工扩一次（ext4 镜像）：
-
-```sh
-parted -s /dev/nvme0n1 resizepart 2 100%
-partx -u /dev/nvme0n1
-resize2fs /dev/nvme0n1p2
-```
-
-squashfs 镜像则扩 `/overlay` 所在分区后 `resize.f2fs`/`resize2fs`。
+> 为什么 p3 不预置进镜像：镜像里的 p3 尺寸构建期就冻结了，与盘上「剩余空间」永不相等，
+> `sysupgrade` 会判定分区布局改变并整盘覆写，p3 与数据每次升级全丢。镜像保持 stock 两分区
+> （p1+p2）时，默认升级路径逐分区写，p3 一个字节都不动。
 
 ## 写入后开机
 
-镜像写入系统盘并首次开机后，下列动作自动完成，无需交互：
+镜像写入系统盘后**首次开机会自动重启一次**（写层要从 p2 内部的临时 overlay 迁到 p3 的 btrfs 子卷，
+这一步只能在启动早期完成），重启后下列动作自动完成，无需交互：
 
-1. **枚举物理网口**：读出所有真实网口，第一个作为 WAN，其余全部加入 `br-lan`；不重命名网卡，写进配置的就是真实名字。
-2. **写入管理地址**：取构建参数 `custom_router_ip`，缺省 `192.168.100.1`。
-3. **WAN 自动取地址**：沿用上游默认，认证放行后 netifd 的 DHCP 客户端立即拿到地址。
-4. **应用 IPv6 模式**：默认 `nat66`，可一键切 `native` / `off`。
-5. **服务就绪**：启用 ttyd、SSH、swap、并补齐 docker 区域（若装了容器）。
+1. **建写层**（第一次开机）：在系统盘尾部建 p3、建四个子卷、给 `@docker`/`@swap` 置 NOCOW，然后重启。
+2. **枚举物理网口**（第二次开机）：读出所有真实网口，第一个作为 WAN，其余全部加入 `br-lan`；不重命名网卡，写进配置的就是真实名字。
+3. **写入管理地址**：取构建参数 `custom_router_ip`，缺省 `192.168.100.1`。
+4. **WAN 自动取地址**：沿用上游默认，认证放行后 netifd 的 DHCP 客户端立即拿到地址。
+5. **应用 IPv6 模式**：默认 `nat66`，可一键切 `native` / `off`。
+6. **服务就绪**：启用 ttyd、SSH、swap（`/swap/swapfile`，在 `@swap` 子卷上），并补齐 docker 区域（若装了容器）。
 
-日志写入 `/etc/config/uci-defaults-log.txt`；脚本执行成功后自删，不会重复运行。完成后浏览器打开 `http://192.168.100.1`，用户 `root`，密码为空。
+日志：`/etc/config/overlay-setup.log`（建 p3 的过程）、`/etc/config/uci-defaults-log.txt`（端口/管理地址/swap）；
+脚本执行成功后自删，不会重复运行。完成后浏览器打开 `http://192.168.100.1`，用户 `root`，密码为空。
 
 ## 注意事项
 
@@ -91,7 +87,11 @@ squashfs 镜像则扩 `/overlay` 所在分区后 `resize.f2fs`/`resize2fs`。
 - **上级设备关闭 DHCP**：AP 需工作在 AP / 桥接模式，否则两个 DHCP 抢答，表现为能连 WiFi 但无法上网。
 - **管理网段可能撞段**：`192.168.100.0/24` 与部分光猫维护地址重叠；撞段时按[安装手册](docs/install.md)手工改址。
 - **刷写不可逆**：写入会清空目标盘全部分区，刷前确认盘符并备份数据。
-- **根分区只有 2G**：装大量容器前先按上文手工扩容，否则 `/` 会先满。
+- **四个子卷共享一个池子且无配额**：`@overlay`（系统层）、`@docker`（容器）、`@swap`、`@data`（个人数据）共用 p3，
+  `@data` 写满会让系统层也 ENOSPC（btrfs 满盘恢复麻烦）。大文件请放外接数据盘 `/mnt/data`。
+- **恢复出厂用 `overlay-reset`**：`firstboot` / `jffs2reset` 在本固件**无效**（写层不在 `rootfs_data` 上），
+  用 `overlay-reset --yes` 清系统层，或重刷镜像。`@docker`/`@data` 的数据不会被它清掉。
+- **别用 `-p` 或改根分区尺寸升级**：会让 `sysupgrade` 整盘覆写，p3 与数据全丢。升级前先 `sysupgrade -T <镜像>` 预演。
 - **代理默认关闭**：nikki 出厂 `enabled=0`，先让认证跑通再启用。
 - **认证需手动初始化一次**：出厂 `/etc/minieap.conf` 为空，先按 [锐捷认证](docs/ruijie.md) 手动跑一次并加 `-w`。
 
@@ -106,12 +106,12 @@ squashfs 镜像则扩 `/overlay` 所在分区后 `resize.f2fs`/`resize2fs`。
 - 运维：argon 主题、ttyd、filemanager、commands、package-manager、nlbwmon、vnstat2、statistics、watchcat、autoreboot
 - 网络：BBR、FullCone NAT、nft-tproxy/tun 内核模块、ip-full、ethtool-full、irqbalance
 - 调试：htop、iftop、tcpdump、iperf3、bind-dig、lm-sensors、smartmontools、nvme-cli
-- 存储与分区：parted、sfdisk、e2fsprogs、zram-swap
+- 存储与分区：btrfs-progs、gdisk、parted、sfdisk、e2fsprogs、chattr/lsattr、zram-swap
 - 拨号：ppp / ppp-mod-pppoe（改 WAN 接口协议启用）
 
 ## 文档
 
-- [安装与首次启动](docs/install.md)：写盘、首启动作、进入后台
+- [安装与首次启动](docs/install.md)：写盘、首启重启与建 p3、进入后台、升级与恢复出厂
 - [锐捷认证](docs/ruijie.md)：minieap 配置与排障
 - [网络与端口](docs/network.md)：端口分配、改口、AP 模式、NAT66
 - [家/校双 profile](docs/profile.md)：`netprofile` 切换、防检测一档/二档、记忆机制

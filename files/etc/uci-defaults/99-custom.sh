@@ -88,8 +88,24 @@ if command -v dockerd >/dev/null 2>&1; then
 	log "docker zone ensured"
 fi
 
-# ---- 6. swap（swapfile + zram）----
-[ -x /usr/sbin/swapctl ] && /usr/sbin/swapctl apply >>"$LOGFILE" 2>&1
+# ---- 6. swap（swapfile 在 @swap 子卷上；zram 由 swapctl 一并处理）----
+# 顺序：本脚本由 /etc/init.d/boot（START=10）执行，而 @swap 由 /etc/init.d/btrfs-subvols
+# （START=12）挂载 ⇒ 这里跑的时候 /swap 通常还不存在。swap 的自启在 btrfs-subvols 里做完，
+# 这里只在"已经挂上"时顺手补一次；没挂就记 deferred 跳过，绝不硬失败
+# （uci-defaults 返回 0 就自删，这里失败一次等于 swap 永久缺位）。
+SWAP_MNT=${SWAP_MNT:-/swap}
+PROC_MOUNTS=${PROC_MOUNTS:-/proc/mounts}
+if [ ! -x /usr/sbin/swapctl ]; then
+	log "swap skipped: 未安装 swapctl"
+elif awk -v m="$SWAP_MNT" '$2 == m { f = 1; exit } END { exit !f }' "$PROC_MOUNTS" 2>/dev/null; then
+	if /usr/sbin/swapctl apply >>"$LOGFILE" 2>&1; then
+		log "swap applied: $SWAP_MNT"
+	else
+		log "WARN: swapctl apply 失败，swap 本次未启用（btrfs-subvols 每次开机会重试）"
+	fi
+else
+	log "swap deferred: $SWAP_MNT 未挂载（@swap 由 /etc/init.d/btrfs-subvols START=12 挂载并负责 swap 自启），本次跳过"
+fi
 
 # 端口对账不放在首启阶段：uci-defaults 由 /etc/init.d/boot 执行（START=10），
 # netifd 还没起，`ip link show master br-lan` 恒为空，只会记一条假 WARN（backlog N5）。

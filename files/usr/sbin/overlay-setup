@@ -1,0 +1,368 @@
+#!/bin/sh
+# overlay-setup —— 首启初始化 btrfs 写层（由 uci-defaults 95-overlay-setup.sh 调用）。
+#
+# 为什么首启做而不是预置进镜像：镜像里预置 p3 会让镜像分区表与盘上分区表永不相等，
+# sysupgrade 判定 "Partition layout has changed" 后整盘覆写，p3 与数据全丢。
+# 镜像保持 stock 两分区（p1 ESP + p2 squashfs）时，默认升级路径逐分区写，p3 一个字节都不动。
+#
+# 状态机：
+#   S0 定位启动盘：/rom 背后那块盘（不按设备名猜，见 rom_part）
+#   S1 就绪判据：**当前** /overlay 的 FSTYPE=btrfs 且含子卷 @overlay → 直接 exit 0
+#   S2 p3 不存在 → sgdisk -e（GPT 备份头挪到盘尾）+ sgdisk -n 3:0:0 → partx -a → 轮询节点
+#   S3 p3 非 btrfs → mkfs.btrfs -L wrt-overlay -f；是 btrfs 但 label 不对 → 只改 label
+#   S4 缺子卷 → 临时挂 subvolid=5 → subvolume create → chattr +C @docker/@swap → 卸载
+#   S5 未就绪 → 只有"本次真的建了东西"才 sync + 重启一次（preinit 的 extroot 这才接管 /overlay）；
+#              什么都没建却仍不就绪 = 不会自愈，写 kmsg + 日志后 exit 3，**不重启**
+#
+# 退出码：
+#   0 已就绪（/overlay 当前就是 btrfs 的 @overlay）
+#   1 某一步失败（可重试；uci-defaults 返回非 0 会在下次开机重试）
+#   2 已建好并下发重启，等下次开机确认（此时允许非 0：不能把"已下发"当成"已生效"）
+#   3 无法自愈/不支持（整盘 root、缺 btrfs 命令、什么都没建却仍不就绪）→ 不重启，留现场给人看
+#   4 找不到 /rom 背后的设备
+#
+# 三条纪律：
+#   1) 每一步都幂等：p3 在就不碰分区表；label 已是 wrt-overlay 就不 mkfs（防误删数据）。
+#   2) 就绪判据必须看"当前写层"，不能只看"子卷存在"——否则 extroot 没生效时会误判完成，
+#      脚本被 uci-defaults 自删，从此静默跑在 p2 的内部 overlay 上。
+#   3) 失败一律非 0 + 写日志，绝不动 p2 里的 rootfs_data；uci-defaults 下次开机会重试。
+#
+# 外部命令与路径都可用环境变量覆盖（沙盒用例 shell/tests/overlay-setup.sh 靠这个驱动）：
+#   PROC_MOUNTS PROC_MOUNTINFO SYS_BLOCK SYS_DEV_BLOCK DEV_DIR ROM_DIR OVERLAY_DIR
+#   TOPLEVEL_MNT SGDISK MKFS_BTRFS BTRFS PARTX CHATTR MOUNT UMOUNT REBOOT
+#   SYNC SLEEP OVERLAY_SETUP_LOG
+#
+# 用法：overlay-setup [--dry-run]
+
+set -u
+
+PROC_MOUNTS=${PROC_MOUNTS:-/proc/mounts}
+PROC_MOUNTINFO=${PROC_MOUNTINFO:-/proc/self/mountinfo}
+SYS_BLOCK=${SYS_BLOCK:-/sys/block}
+SYS_DEV_BLOCK=${SYS_DEV_BLOCK:-/sys/dev/block}
+DEV_DIR=${DEV_DIR:-/dev}
+ROM_DIR=${ROM_DIR:-/rom}
+OVERLAY_DIR=${OVERLAY_DIR:-/overlay}
+TOPLEVEL_MNT=${TOPLEVEL_MNT:-/tmp/.overlay-setup}
+SGDISK=${SGDISK:-sgdisk}
+MKFS_BTRFS=${MKFS_BTRFS:-mkfs.btrfs}
+BTRFS=${BTRFS:-btrfs}
+PARTX=${PARTX:-partx}
+CHATTR=${CHATTR:-chattr}
+MOUNT=${MOUNT:-mount}
+UMOUNT=${UMOUNT:-umount}
+REBOOT=${REBOOT:-reboot}
+SYNC=${SYNC:-sync}
+SLEEP=${SLEEP:-sleep}
+LOGGER=${LOGGER:-logger}
+KMSG=${KMSG:-/dev/kmsg}
+LOG=${OVERLAY_SETUP_LOG:-/etc/config/overlay-setup.log}
+
+LABEL=wrt-overlay
+SUBVOLS='@overlay @docker @swap @data'
+# NOCOW 只能落在子卷根目录的 inode 属性上（挂载级 nodatacow 是 fs 级共享参数，
+# 不能按子卷分，且写在 @docker 的挂载上也不会生效）。
+# @data 不加：个人数据要 CoW + 校验和（可 scrub 查静默损坏）。
+NOCOW_SUBVOLS='@docker @swap'
+P3NUM=3
+
+usage() {
+	sed -n '3,30p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+}
+
+DRY=0
+for _a in "$@"; do
+	case "$_a" in
+	--dry-run) DRY=1 ;;
+	-h|--help) usage; exit 0 ;;
+	'') : ;;
+	*)
+		printf 'overlay-setup: 未知参数 [%s]，可用 --dry-run\n' "$_a" >&2
+		exit 1
+		;;
+	esac
+done
+
+log() {
+	_msg="$(date '+%F %T') $*"
+	printf '%s\n' "$_msg"
+	printf '%s\n' "$_msg" >>"$LOG" 2>/dev/null || true
+}
+
+# 关键事件单独再打一份到 logread 环形缓冲：/etc/config/overlay-setup.log 写在**第一次开机**
+# 的 p2 内部 overlay 里，extroot 生效后 mount_root 直接返回、rootfs_data 根本没被挂载 ⇒
+# 第二次开机就读不到第一天的日志了。所以失败/需重启这类结论必须同时进 logread。
+klog() {
+	if have_cmd "$LOGGER"; then
+		"$LOGGER" -t overlay-setup "$*" >/dev/null 2>&1 || true
+	fi
+}
+
+# 把本次日志再抄一份到 kmsg（串口/dmesg 可读），用于 rebрот 前留证
+kmsg_dump() {
+	[ -w "$KMSG" ] || return 0
+	{
+		printf '<4>overlay-setup: ==== 本次日志副本开始 ====\n'
+		sed 's/^/<4>overlay-setup: /' "$LOG" 2>/dev/null
+		printf '<4>overlay-setup: ==== 本次日志副本结束 ====\n'
+	} >>"$KMSG" 2>/dev/null || true
+}
+
+die() { # <退出码> <消息>
+	log "ERROR: $2"
+	klog "ERROR: $2"
+	kmsg_dump
+	printf 'overlay-setup: %s\n' "$2" >&2
+	exit "$1"
+}
+
+# 执行写操作（--dry-run 时只打印，什么都不碰）
+run() {
+	if [ "$DRY" = 1 ]; then
+		printf 'DRY: %s\n' "$*"
+		log "DRY: $*"
+		return 0
+	fi
+	log "+ $*"
+	"$@" >>"$LOG" 2>&1
+}
+
+# ---------- S0 定位启动盘 ----------
+# 真机 /proc/mounts 里 /rom 的设备是 bdev 别名 /dev/root（不含分区号），按名字反推不可靠。
+# 改用 mountinfo 第 3 字段的 maj:min → /sys/dev/block/<maj:min>/uevent 的 DEVNAME，
+# 拿到真实分区名（sda2 / nvme0n1p2），SATA 与 NVMe 一视同仁。
+rom_part() {
+	if [ -r "$PROC_MOUNTINFO" ]; then
+		_mm=$(awk -v m="$ROM_DIR" '$5 == m { print $3; exit }' "$PROC_MOUNTINFO" 2>/dev/null)
+		if [ -n "${_mm:-}" ]; then
+			_dn=$(sed -n 's/^DEVNAME=//p' "$SYS_DEV_BLOCK/$_mm/uevent" 2>/dev/null)
+			if [ -n "${_dn:-}" ]; then
+				printf '%s\n' "$_dn"
+				return 0
+			fi
+		fi
+	fi
+	# 回退：/proc/mounts 直接给了分区名
+	_d=$(awk -v m="$ROM_DIR" '$2 == m { print $1; exit }' "$PROC_MOUNTS" 2>/dev/null)
+	[ -n "${_d:-}" ] || return 1
+	_d=${_d##*/}
+	case "$_d" in root|'') return 1 ;; esac
+	printf '%s\n' "$_d"
+}
+
+# <分区名> → 设置 DISK / PARTNUM / SEP；认不出（整盘 root、dm-0、loop0…）返回 1。
+# 白名单只放真实的分区形态，避免对 /dev/dm- 或 /dev/loop 下手。
+split_dev() {
+	case "$1" in
+	nvme[0-9]*p[0-9]*|mmcblk[0-9]*p[0-9]*)
+		PARTNUM=${1##*p}
+		DISK=${1%p*}
+		SEP=p
+		;;
+	sd[a-z]*[0-9]|vd[a-z]*[0-9]|hd[a-z]*[0-9])
+		PARTNUM=$(printf '%s' "$1" | sed 's/.*[^0-9]//')
+		DISK=${1%"$PARTNUM"}
+		SEP=''
+		;;
+	*) return 1 ;;
+	esac
+	[ -n "$DISK" ] && [ -n "$PARTNUM" ] || return 1
+	return 0
+}
+
+# ---------- 探测 ----------
+# 该设备上 btrfs 的 label；非 btrfs 返回非 0。
+fs_label() {
+	_show=$("$BTRFS" filesystem show "$1" 2>/dev/null) || return 1
+	printf '%s\n' "$_show" | awk -v q="'" -v d="$1" '
+		/^Label: / {
+			l = $0
+			sub(/^Label: /, "", l)
+			sub(/[ \t]+uuid:.*$/, "", l)
+			gsub(q, "", l)
+			lab = l
+		}
+		$1 == "devid" && $NF == d { hit = lab }
+		END { if (hit == "") exit 1; print hit }'
+}
+
+fs_state() { # <dev> → wrt | other | none
+	if ! _lab=$(fs_label "$1"); then
+		printf 'none\n'
+		return 0
+	fi
+	if [ "$_lab" = "$LABEL" ]; then
+		printf 'wrt\n'
+	else
+		printf 'other\n'
+	fi
+}
+
+# 挂载信息一律读 /proc/mounts：25.12.2 x86_64 源里**没有 findmnt**（util-linux 不装，
+# 三个 index.json 都搜不到）。依赖它会让就绪判据永远为假 —— 每次开机都判"未就绪"，
+# 于是又 reboot，形成重启循环。
+mnt_fstype() { # <挂载点> → fstype；未挂载则输出空
+	awk -v m="$1" '$2 == m { print $3; exit }' "$PROC_MOUNTS" 2>/dev/null
+}
+
+overlay_ready() {
+	_fs=$(mnt_fstype "$OVERLAY_DIR")
+	[ "$_fs" = btrfs ] || return 1
+	"$BTRFS" subvolume list "$OVERLAY_DIR" 2>/dev/null | grep -qE 'path @overlay$' || return 1
+	return 0
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+log "=== overlay-setup start (dry-run=$DRY) ==="
+
+if ! _part=$(rom_part); then
+	die 4 "定位不到 $ROM_DIR 背后的设备（${PROC_MOUNTS} 与 ${PROC_MOUNTINFO} 都没有）；不安猜设备，直接放弃"
+fi
+if ! split_dev "$_part"; then
+	die 3 "根文件系统在整盘设备 [$_part] 上（没有分区号）：本固件要求 squashfs 位于独立分区 p2，请改用带分区表的镜像"
+fi
+[ -d "$SYS_BLOCK/$DISK" ] || die 4 "找不到块设备目录 $SYS_BLOCK/${DISK}（${_part} 所在的盘）"
+P3NAME=${DISK}${SEP}${P3NUM}
+DISK_DEV=$DEV_DIR/$DISK
+P3_DEV=$DEV_DIR/$P3NAME
+log "启动盘 ${DISK_DEV}（/rom=${_part}），目标分区 $P3_DEV"
+
+p3_exists() {
+	[ -e "$SYS_BLOCK/$DISK/$P3NAME" ] && return 0
+	[ -b "$P3_DEV" ] && return 0
+	return 1
+}
+
+# 没有 btrfs 命令时判据恒为假、后续也没法建子卷 —— 必须先硬失败，
+# 不能"装作未就绪"再进 S5（那会变成每次开机重启一次）。
+have_cmd "$BTRFS" || die 3 "找不到 btrfs 命令（btrfs-progs 未进镜像？）：无法判断/建立子卷，直接放弃，不重启"
+if have_cmd "$MKFS_BTRFS"; then _have_mkfs=1; else _have_mkfs=0; fi
+
+# 本次是否真的创建/改动过东西：只有建过东西，重启才有可能改变状态。
+# 什么都没建却仍不就绪 ⇒ 再重启只会回到同一个状态（首启阶段网络没起，无法 SSH 介入）。
+_created=0
+
+# ---------- S1 就绪判据 ----------
+if overlay_ready; then
+	log "overlay 已是 btrfs 且含子卷 @overlay（up-to-date），无需任何操作"
+	exit 0
+fi
+
+# ---------- S2 分区 ----------
+if p3_exists; then
+	log "p$P3NUM 已存在（${P3_DEV}），跳过分区表操作"
+else
+	# dd 到大盘后 GPT 备份头还停在镜像末尾，先把备份头挪到盘尾，
+	# 否则"建到盘尾"的 p3 会与备份 GPT 冲突。没有 sgdisk 就硬失败，
+	# 不要"就地建一个不到盘尾的 p3"。
+	run "$SGDISK" -e "$DISK_DEV" ||
+		die 1 "sgdisk -e $DISK_DEV 失败（无法把 GPT 备份头挪到盘尾；缺 gdisk 包？）"
+	run "$SGDISK" -n "${P3NUM}:0:0" -t "${P3NUM}:8300" -c "${P3NUM}:$LABEL" "$DISK_DEV" ||
+		die 1 "sgdisk -n 建 p$P3NUM 失败"
+	# partx 的 -a 与 -u 是互斥组合（-a 自己就会更新），只能单独用 -a
+	run "$PARTX" -a "$DISK_DEV" || die 1 "partx -a $DISK_DEV 失败（内核未感知新分区表）"
+	if [ "$DRY" = 0 ]; then
+		_i=0
+		while [ "$_i" -lt 10 ]; do
+			p3_exists && break
+			"$SLEEP" 1
+			_i=$((_i + 1))
+		done
+		p3_exists ||
+			die 1 "p$P3NUM 设备节点 10s 内未出现（无 udev，只靠 devtmpfs + partx）；请重启后重跑 overlay-setup"
+		_created=1
+	fi
+fi
+
+# ---------- S3 文件系统 ----------
+case "$(fs_state "$P3_DEV")" in
+wrt)
+	log "p$P3NUM 已是 label=$LABEL 的 btrfs，跳过 mkfs"
+	;;
+other)
+	# 已是 btrfs 但 label 不是我们的：只改 label，绝不 mkfs（不毁已有数据）
+	run "$BTRFS" filesystem label "$P3_DEV" "$LABEL" || die 1 "改 btrfs label 失败: $P3_DEV"
+	[ "$DRY" = 1 ] || _created=1
+	;;
+*)
+	[ "$_have_mkfs" = 1 ] || die 3 "找不到 mkfs.btrfs（btrfs-progs 未进镜像？）：无法在 p3 上建文件系统，不重启"
+	run "$MKFS_BTRFS" -L "$LABEL" -f "$P3_DEV" || die 1 "mkfs.btrfs $P3_DEV 失败"
+	[ "$DRY" = 1 ] || _created=1
+	;;
+esac
+
+# ---------- S4 子卷 ----------
+if [ "$DRY" = 1 ]; then
+	for _sv in $SUBVOLS; do
+		run "$BTRFS" subvolume create "$TOPLEVEL_MNT/$_sv"
+	done
+	for _sv in $NOCOW_SUBVOLS; do
+		run "$CHATTR" +C "$TOPLEVEL_MNT/$_sv"
+	done
+else
+	mkdir -p "$TOPLEVEL_MNT" 2>/dev/null
+	run "$MOUNT" -t btrfs -o subvolid=5,noatime "$P3_DEV" "$TOPLEVEL_MNT" ||
+		die 1 "临时挂载 ${P3_DEV}（subvolid=5）到 $TOPLEVEL_MNT 失败"
+	_have=$("$BTRFS" subvolume list "$TOPLEVEL_MNT" 2>/dev/null)
+	_new=0
+	for _sv in $SUBVOLS; do
+		if printf '%s\n' "$_have" | grep -qE "path ${_sv}\$"; then
+			log "子卷已存在: $_sv"
+			continue
+		fi
+		if ! run "$BTRFS" subvolume create "$TOPLEVEL_MNT/$_sv"; then
+			run "$UMOUNT" "$TOPLEVEL_MNT"
+			die 1 "创建子卷 $_sv 失败"
+		fi
+		_new=$((_new + 1))
+		_created=1
+	done
+	if have_cmd "$CHATTR"; then
+		for _sv in $NOCOW_SUBVOLS; do
+			run "$CHATTR" +C "$TOPLEVEL_MNT/$_sv" ||
+				log "WARN: chattr +C $_sv 失败（/etc/init.d/btrfs-subvols 每次开机还会复核补设）"
+		done
+	else
+		# chattr 在 25.12 是独立 apk 包，缺了不能让首启整条链路挂掉：
+		# @docker 退回 CoW（可用，只是写放大），swapfile 的 NOCOW 由 swapctl 侧报错。
+		log "ERROR: 找不到 chattr（chattr 包缺失）：跳过 @docker/@swap 的 NOCOW 设置，@docker 退回 CoW；swapfile 可能需要 NOCOW，见 swapctl 报错"
+	fi
+	run "$UMOUNT" "$TOPLEVEL_MNT" || log "WARN: 卸载 $TOPLEVEL_MNT 失败（重启后自然消失）"
+	rmdir "$TOPLEVEL_MNT" 2>/dev/null
+	log "子卷就绪（本次新建 $_new 个）: $SUBVOLS"
+fi
+
+# ---------- S5 生效需要一次重启（但只允许重启一次）----------
+if overlay_ready; then
+	log "overlay 已切到 btrfs 子卷 @overlay（up-to-date）"
+	exit 0
+fi
+
+if [ "$DRY" = 1 ]; then
+	log "DRY: 以上为预演，未做任何修改"
+	exit 0
+fi
+
+if [ "$_created" != 1 ]; then
+	# 本次什么都没建，状态却仍不就绪 ⇒ 再重启一次只会得到**完全相同**的状态。
+	# uci-defaults 在 START=10（网络还没起）执行，此时重启 = 无限重启且没有 SSH 介入窗口，
+	# 等于把设备刷成砖。所以这里必须停下来：写日志 + logread + kmsg，退出码 3，不重启。
+	log "ERROR: 未就绪，但本次没有创建任何东西：不重启（避免无限重启）。status=not-ready created=0 disk=$DISK_DEV p3=$P3_DEV"
+	log "ERROR: 常见原因：kmod-fs-btrfs 未进镜像（/proc/filesystems 无 btrfs）、p3 的 label 不是 ${LABEL}、p3 被人为改动过、/overlay 已被别的东西占用"
+	klog "致命：未就绪且无可创建项，为避免无限重启这里不重启；详见 /etc/config/overlay-setup.log 与 dmesg"
+	kmsg_dump
+	exit 3
+fi
+
+log "p$P3NUM 与子卷已就绪，但当前 /overlay 还不是 @overlay：重启一次让 preinit 的 extroot 接管（只此一次）"
+klog "已创建 p3/子卷，需要重启一次使 extroot 生效"
+kmsg_dump
+run "$SYNC"
+run "$REBOOT" || die 1 "重启命令失败；请手动重启一次使 extroot 生效"
+
+# 走到这里说明 reboot 返回了（真机上通常不会）。既然"当前 /overlay 仍然不是 @overlay"，
+# 就不能 exit 0：uci-defaults 会把脚本删掉，从此再没人检查写层到底切没切。
+log "已下发重启，但本次仍未切到 @overlay：保留本脚本，下次开机重试确认"
+exit 2

@@ -13,7 +13,9 @@ count=$(ls "$W" | wc -l | tr -d ' ')
 
 B="$W/Build-N5105-x86_64-25.12.x.yml"
 grep -q "^name: Build N5105 x86_64 25.12.x" "$B" && echo "ok: 显示名正确" || { echo "FAIL: 显示名未更新"; FAIL=1; }
-grep -q "ext4-combined-efi.img.gz" "$B" && echo "ok: 仍上传 ext4 产物" || { echo "FAIL: 未上传 ext4 产物"; FAIL=1; }
+# 2026-11-05：交付根改为 squashfs（btrfs 子卷 overlay 方案），ext4 产物不再发布。
+grep -q "squashfs-combined-efi.img.gz" "$B" && echo "ok: 上传 squashfs 产物" || { echo "FAIL: 未上传 squashfs 产物"; FAIL=1; }
+grep -q "ext4-combined-efi.img.gz" "$B" && { echo "FAIL: 仍在发布 ext4 产物"; FAIL=1; } || echo "ok: 不再发布 ext4 产物"
 grep -q "custom/custom_router_ip.txt:/home/build/immortalwrt/files/etc/config/custom_router_ip.txt" "$B" \
 	&& echo "ok: custom 单文件挂载未被改回整目录" || { echo "FAIL: custom 挂载方式回退"; FAIL=1; }
 

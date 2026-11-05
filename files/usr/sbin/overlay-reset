@@ -1,0 +1,122 @@
+#!/bin/sh
+# overlay-reset —— 恢复出厂（extroot 版）。
+#
+# 为什么需要它：**firstboot / jffs2reset 在本固件无效**。
+# fstools 的 factoryreset 只处理 rootfs_data（volume_find("rootfs_data") → jffs2_reset，
+# 且只有它被挂载时才 overlay_delete）。本固件开了 extroot，rootfs_data 根本没被挂载，
+# 那两个命令会"报成功但什么都没删"：账号、密钥、装过的包仍然留在 @overlay 里。
+# 恢复出厂请用本命令，或重刷固件。
+#
+# 做的是：清空 /overlay/upper（系统层的可写差异，含隐藏文件）与 /overlay/work（overlayfs 的
+# workdir，残留会影响下次挂载）→ sync → 重启。
+# 不动 @docker / @swap / @data：那是独立子卷，容器数据与个人文件不属"系统配置"。
+#
+# 安全阀：extroot **失败**时 fstools 同样会 fopivot("/overlay","/rom")，p2 内部临时 overlay 的
+# upper/work 长得跟真的一模一样 ⇒ 光看"目录存在"区分不了两种世界。所以必须核对 /overlay 的
+# 文件系统类型：不是 btrfs 就拒绝执行（那说明 extroot 没生效，清掉的是内部写层，清完什么也
+# 恢复不了）。确实要清（例如已经从 Live 环境手动挂好），再加 --force-non-extroot 显式放行。
+#
+# 用法：
+#   overlay-reset                       只打印计划，一个字节都不动
+#   overlay-reset --yes                 真的清空并重启（恢复出厂）
+#   overlay-reset --yes --force-non-extroot
+#                                       已知 /overlay 不是 btrfs，仍要清（危险，先想清楚）
+
+set -u
+
+UPPER=${OVERLAY_UPPER:-/overlay/upper}
+WORK=${OVERLAY_WORK:-/overlay/work}
+OVERLAY_DIR=${OVERLAY_DIR:-/overlay}
+# 挂载信息一律读 /proc/mounts：25.12.2 源里没有 findmnt（util-linux 不装）
+PROC_MOUNTS=${PROC_MOUNTS:-/proc/mounts}
+SYNC=${SYNC:-sync}
+REBOOT=${REBOOT:-reboot}
+
+usage() {
+	sed -n '3,27p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+}
+
+YES=0
+FORCE=0
+for _a in "$@"; do
+	case "$_a" in
+	--yes|-y) YES=1 ;;
+	--force-non-extroot) FORCE=1 ;;
+	-h|--help) usage; exit 0 ;;
+	'') : ;;
+	*)
+		printf 'overlay-reset: 未知参数 [%s]，可用 --yes / --force-non-extroot\n' "$_a" >&2
+		exit 1
+		;;
+	esac
+done
+
+# 统计/清空用同一组 glob（含隐藏文件），不依赖 ls 的 -A
+count_entries() { # <目录> → 打印顶层条目数
+	[ -d "$1" ] || { printf '0\n'; return 0; }
+	_c=0
+	for _f in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+		[ -e "$_f" ] || [ -L "$_f" ] || continue
+		_c=$((_c + 1))
+	done
+	printf '%s\n' "$_c"
+}
+
+clear_dir() { # <目录>：清空内容（含隐藏文件），目录本身保留
+	if [ -d "$1" ]; then
+		rm -rf "$1"/* "$1"/.[!.]* "$1"/..?* 2>/dev/null
+	fi
+	count_entries "$1"
+}
+
+if [ ! -d "$UPPER" ]; then
+	printf 'overlay-reset: 找不到 %s（extroot 未生效？当前 /overlay 不是 btrfs 子卷）\n' "$UPPER" >&2
+	printf 'overlay-reset: 什么都没做。若 /overlay 仍是 p2 内部 overlay，先确认 btrfs 写层已生效。\n' >&2
+	exit 1
+fi
+
+_fs=$(awk -v m="$OVERLAY_DIR" '$2 == m { print $3; exit }' "$PROC_MOUNTS" 2>/dev/null)
+_n=$(count_entries "$UPPER")
+_nw=$(count_entries "$WORK")
+
+printf 'overlay 上层: %s\n' "$UPPER"
+printf 'overlay workdir: %s（%s 个条目）\n' "$WORK" "$_nw"
+printf '当前写层文件系统: %s\n' "${_fs:-未知}"
+printf '将删除的顶层条目: %s 个\n' "$_n"
+printf '不动 @docker / @swap / @data（容器数据与个人文件不属于系统配置）\n'
+printf '\n'
+printf '注意：firstboot / jffs2reset 在本固件无效（extroot 生效时 rootfs_data 没被挂载，\n'
+printf '      它们会报成功但什么都没删）。恢复出厂请用本命令，或重刷固件。\n'
+printf '\n'
+
+# 安全阀：/overlay 不是 btrfs ⇒ extroot 没生效，upper 只是 p2 内部的临时写层。
+# 清它既不能恢复出厂（真配置在 p3 上），又会把当前能用的写层弄掉。
+if [ "$_fs" != btrfs ] && [ "$FORCE" != 1 ]; then
+	printf 'overlay-reset: 当前 /overlay 的文件系统是 [%s]，不是 btrfs ⇒ extroot 没有生效。\n' "${_fs:-未知}" >&2
+	printf 'overlay-reset: 此时 /overlay/upper 只是 p2 内部的临时写层，清它不会恢复出厂（真配置在 p3 上）。\n' >&2
+	printf 'overlay-reset: 已拒绝，什么都没做。确认无误要强行清，请加 --force-non-extroot。\n' >&2
+	exit 1
+fi
+
+if [ "$YES" != 1 ]; then
+	printf '这是预演，没有删除任何东西。确认执行恢复出厂请加 --yes：\n'
+	printf '  overlay-reset --yes\n'
+	exit 0
+fi
+
+_left=$(clear_dir "$UPPER")
+_leftw=$(clear_dir "$WORK")
+# 复核：清完必须为空，否则宁可报错也不要"看起来重置了"
+if [ "$_left" != 0 ] || [ "$_leftw" != 0 ]; then
+	printf 'overlay-reset: 清空失败（upper 剩 %s 个，work 剩 %s 个）；未重启，请人工检查 %s / %s\n' \
+		"$_left" "$_leftw" "$UPPER" "$WORK" >&2
+	exit 1
+fi
+
+printf '已清空 %s（含 workdir），同步并重启完成恢复出厂。\n' "$UPPER"
+"$SYNC" 2>/dev/null || true
+"$REBOOT" || {
+	printf 'overlay-reset: 重启命令失败，请手动执行 reboot\n' >&2
+	exit 1
+}
+exit 0

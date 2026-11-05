@@ -16,10 +16,10 @@
 
 ## 2. 下载与校验
 
-从构建产物的 Release 页面下载 `*ext4-combined-efi.img.gz`（文件名里含 `n5105`，认准 `ext4-combined-efi`，别拿成 `squashfs`）：
+从构建产物的 Release 页面下载 `*squashfs-combined-efi.img.gz`（文件名里含机型标识 `n5105`）：
 
 ```sh
-ls -lh *ext4-combined-efi*.img.gz
+ls -lh *squashfs-combined-efi*.img.gz
 gzip -t immortalwrt-*.img.gz && echo "压缩包完整"
 shasum -a 256 immortalwrt-*.img.gz     # Linux 用 sha256sum，与发布页核对
 ```
@@ -27,8 +27,10 @@ shasum -a 256 immortalwrt-*.img.gz     # Linux 用 sha256sum，与发布页核�
 后文统一用变量表示实际文件名（**按你下载到的名字改这一行**）：
 
 ```sh
-IMG=immortalwrt-25.12.2-x86-64-generic-ext4-combined-efi-n5105.img.gz
+IMG=immortalwrt-25.12.2-x86-64-generic-squashfs-combined-efi-n5105.img.gz
 ```
+
+> 本固件只发布 squashfs 产物：根是只读 squashfs，写层在系统盘 p3 的 btrfs 子卷 `@overlay` 上。
 
 ## 3. 做启动 U 盘（三选一）
 
@@ -68,7 +70,10 @@ Ventoy 适合「一只 U 盘同时放 Live 系统和固件镜像」，注意两�
 
 ## 4. 写入系统盘（推荐流程）
 
-镜像是一整块磁盘镜像（含 GPT + EFI 分区 + ext4 根），必须**整盘写入**，不能拷成文件。
+镜像是一整块磁盘镜像（GPT + EFI 分区 p1 + squashfs 根分区 p2，p2 固定 512 MiB），必须**整盘写入**，不能拷成文件。
+
+> 镜像里**只有 p1、p2 两个分区**：p3（btrfs 写层）由首启脚本在盘尾创建，故意不预置。
+> 预置会让镜像分区表与盘上不一致，`sysupgrade` 判定布局改变后整盘覆写，p3 与数据全丢。
 
 1. U 盘启动后进 Live 系统（Ventoy 里选任意 Linux Live ISO，或方式 A/B 做好的镜像 U 盘本身）。
 2. 找到镜像文件和目标盘：
@@ -89,25 +94,49 @@ sync
 
 ## 5. 首次启动会做什么
 
-首启脚本 `/etc/uci-defaults/99-custom.sh` 只跑一次（成功后自删），依次做：
+写层（`/overlay` 上的所有写入，包含全部 `/etc` 改动）从 p2 内部的临时 overlay 迁到 p3 的 btrfs 子卷，
+这一步只能在启动早期（preinit）完成，所以**首次开机会自动重启一次**。两次开机各做一件事：
 
-| 步骤 | 说明 |
-|---|---|
-| 扩根分区 | `parted resizepart` + `resize2fs`，只动根分区（feed 里没有 `growpart`，所以走 parted/sfdisk） |
-| 端口角色 | `/usr/sbin/nicsync`：与 `eth0`=WAN、`eth1..3`=LAN 不符时写入真实名字 |
-| 管理地址 | 写 `network.lan.ipaddr`（构建时填的 `custom_router_ip`，默认 `192.168.100.1`） |
-| WAN 关闭 | `wan.auto=0`、`wan6.auto=0`，避免无网阶段乱发包 |
-| 主机名/时间 | `n5105-router` + 安卓 TV 时间服务器映射 |
-| 关闭 EEE | 逐个 `ethX` 执行 `ethtool --set-eee eee off`（i226 稳定性基线） |
-| swap | `swapctl apply`，按 `/etc/config/swap` 建 4G swapfile（根分区没扩容时会失败，属正常） |
+### 第一次开机：建 p3 并重启
 
-看结果：
+| 顺序 | 脚本 | 做什么 |
+|---|---|---|
+| 1 | `/etc/uci-defaults/95-overlay-setup.sh` → `/usr/sbin/overlay-setup` | 在系统盘尾部建 p3（`btrfs`，label `wrt-overlay`）、建 `@overlay`/`@docker`/`@swap`/`@data` 四个子卷、给 `@docker`/`@swap` 置 NOCOW，然后 `sync` + 重启 |
+
+这次开机只跑编号 `< 95` 的 uci-defaults（都是上游默认项），**配网、管理地址、swap 都还没生效**。
+
+### 第二次开机：全部定制项生效
+
+| 顺序 | 脚本 | 做什么 |
+|---|---|---|
+| 1 | `/etc/init.d/btrfs-subvols`（START=12） | 把 `@docker`→`/opt/docker`、`@swap`→`/swap`、`@data`→`/data` 挂上，随后 best-effort 调 `swapctl apply` 建 swapfile（**swap 的自启在这一步**） |
+| 2 | `/etc/uci-defaults/98-campus-nft.sh` | 建防检测用的 `config include` 段 |
+| 3 | `/etc/uci-defaults/99-custom.sh` | 端口角色（首个物理口 WAN、其余入桥，不重命名网卡）、管理地址（构建参数，缺省 `192.168.100.1`）、主机名、`netprofile` 默认档、docker 防火墙区域（swap 已在第 1 步做过，这里只在 `/swap` 已挂时补一次） |
+
+两个日志：
 
 ```sh
-cat /etc/config/uci-defaults-log.txt
-df -h /                # 根分区是否已撑满整个系统盘
-free -m                # swap 是否起来了
+logread -e overlay-setup                   # 第一次开机：建 p3/子卷的过程（成功时看这里）
+cat /etc/config/overlay-setup.log          # 仅当首启**失败且没重启**时才有意义：此时 /etc 还在 p2 的临时 overlay 里
+cat /etc/config/uci-defaults-log.txt       # 第二次开机：端口/管理地址/swap
 ```
+
+> 为什么成功首启不能 `cat` 那个 log 文件：第一次开机的 `/etc` 位于 p2 内部的临时 overlay，
+> extroot 生效后 fstools 直接切走、那份 overlay 不再被挂载 ⇒ 文件既看不见也拿不回来。
+> 所以 `overlay-setup` 的关键事件同时写进内核日志（`logread` 可见），文件只在"没来得及重启"时有用。
+
+确认写层真的落在 p3 上（第二次开机后）：
+
+```sh
+grep -E ' /(overlay|opt/docker|swap|data) ' /proc/mounts
+# 期望四行都是 btrfs，设备指向 p3（nvme0n1p3 / sda3 这种带分区号的名字）
+df -h /overlay                    # 期望接近整盘容量（p3 吃满剩余空间）
+btrfs subvolume list /overlay     # 期望 4 个路径：@overlay @docker @swap @data
+```
+
+> 本固件**没有 `findmnt` / `lsblk`**（25.12 的镜像里不带），判断挂载点一律看 `/proc/mounts` 或用 `mount`。
+
+> 没重启过、或重启后 `/proc/mounts` 里的 `/overlay` 还是那种 `overlayfs:/overlay` 的临时写层 ⇒ 写层没迁成，看第 8 节。
 
 ## 6. 进后台（此时还没有外网）
 
@@ -137,56 +166,120 @@ apk --version                       # 25.12 用 apk 管包，不是 opkg
 
 WAN 出厂是 `proto none` + `auto 0`：**插上网线也不会自己发包**，所以不会因为「先插了认证网络」而失联。
 
-## 8. 根分区扩容（自动失败时手工做）
+## 8. 容量与写层：现在不需要扩容了
 
-首启会自动扩，扩完 `df -h /` 应该接近整盘容量。如果没扩成功（例如分区表异常），手工执行：
+老镜像（ext4 根）需要把整盘空间扩给根分区，**这一版不存在这一步**：
 
-检查：
+- p2（squashfs 根）固定 512 MiB 且**只读**——装多少软件都不会让它变大变小，扩它既无意义也不可能；
+- 所有写入落在 p3 的 btrfs 子卷 `@overlay` 上，p3 是首启自动建到**盘尾**的，天然吃满整盘。
 
-```sh
-df -h /                      # 只有 ~2G 说明自动扩容没生效
-parted -l                    # 确认分区号（通常根是 2，1 是 EFI）
-cat /proc/partitions          # 镜像里没有 lsblk/blkid，用这个看分区大小
-block info 2>/dev/null | head -20
-```
-
-手工扩容（以 `/dev/nvme0n1` + 分区 2 为例，**只动根分区，别碰分区 1 的 EFI**）：
+所以不存在「把分区和文件系统撑大」这回事，老文档里那套分区/文件系统扩容步骤全部作废。要判断空间，只看写层：
 
 ```sh
-fdisk /dev/nvme0n1
-# 交互里依次：
-#   p            打印分区表，记下分区 2 的 Start 扇区
-#   d  2         删除分区 2 的表项（不动数据）
-#   n  2         新建分区 2；First sector 必须填上面记下的同一个值；Last sector 直接回车用满全盘
-#   （提示 "Partition #2 contains a ext4 signature" 时选 N，不要删签名）
-#   w            写入
-reboot
+df -h /overlay            # 写层容量（≈ 整盘容量减去 p1+p2 的 544 MiB）
+df -h /                   # 合并视图，和 /overlay 基本一致
+btrfs filesystem usage /overlay   # 池子整体用量（四个子卷共享同一个池）
 ```
 
-重启后扩文件系统：
+### 8.1 首启建 p3 失败怎么重跑
+
+`overlay-setup` 是幂等的，直接重跑即可（已就绪时只会打印 `up-to-date` 并退出 0）：
 
 ```sh
-resize2fs /dev/nvme0n1p2
-df -h /                      # 应该接近 14G
+/usr/sbin/overlay-setup --dry-run     # 先看它打算做什么，什么都不改
+/usr/sbin/overlay-setup              # 真跑；成功后会自己 sync + 重启
+cat /etc/config/overlay-setup.log     # 哪一步失败会写在最后几行
 ```
 
-风险与回滚：
+几条对症处理：
 
-- 起始扇区填错 = 根分区偏移改变 = **系统起不来**。动手前把 `fdisk -l` 输出拍照/抄下来。
-- 起不来时按 [ops.md](ops.md) 的「备份与回滚」用 Live U 盘救。
-- 扩完之后再执行一次 swap：`swapctl apply`（4G swapfile 需要空间）。
+| 日志里的现象 | 含义 | 处理 |
+|---|---|---|
+| `找不到 label=wrt-overlay 的 btrfs 分区` | p3 还没建出来 / 还没重启生效 | 先跑一次 `/usr/sbin/overlay-setup`，再重启 |
+| `sgdisk -e ... 失败` | 缺 `gdisk` 包，或盘上 GPT 损坏 | 确认 `gdisk` 在包清单里；GPT 损坏按 [ops.md](ops.md) 第 5 节救砖 |
+| `p3 设备节点 10s 内未出现` | 内核没感知新分区表（无 udev，只靠 devtmpfs） | 直接 `reboot`：分区已在表里，重启后会自动接着往下走 |
+| `根文件系统在整盘设备上` | 刷成了无分区表的镜像 | 换回正常镜像重刷 |
 
-## 9. 首次登录检查清单
+`overlay-setup` 失败时**不会**动 p2 里已有的临时写层，所以系统始终可用；uci-defaults 的语义是「返回非 0 就下次开机重试」，
+所以失败后重启一次往往会自己接着做。
+
+> 不要手工 `mkfs.btrfs`/`sgdisk` 去凑 p3：label 必须是 `wrt-overlay`、四个子卷名必须带 `@`，
+> 这些约定写死在 `/etc/config/fstab`（这也是 preinit 唯一认的那一份）。
+
+## 9. 升级（sysupgrade）
+
+默认路径会**保留 p3 与其中数据**，前提是镜像的分区表与盘上一致：
+
+```sh
+scp immortalwrt-*-squashfs-combined-efi-n5105.img.gz root@192.168.100.1:/tmp/
+
+sysupgrade -T /tmp/immortalwrt-*-squashfs-combined-efi-n5105.img.gz   # 预演，只看不改
+sysupgrade    /tmp/immortalwrt-*-squashfs-combined-efi-n5105.img.gz
+```
+
+预演时如果看到这一句，**先停下备份**：
+
+```
+Partition layout has changed. Full image will be written.
+```
+
+它的意思是「整盘覆写」——p3、`@docker`、`@swap`、`@data` 会一起没了。出现这句的典型原因：
+
+- **换了 profile / 改过 `ROOTFS_PARTSIZE`**：本仓库已把根分区固定成 512 MiB 并去掉了尺寸选项，正常不会触发；
+- 用了 `sysupgrade -p`（`SAVE_PARTITIONS=0`，强制整盘 dd）——刷机时**别带 `-p`**；
+- p3 建好后被 `resize`/`move` 过，或分区表被第三方工具重写过。
+
+其他约束：
+
+- **p3 建好后不要再 resize / move**（包括用 `luci-app-diskman` 动分区表）。p3 的起止扇区一旦变化，下次升级就会判定布局改变。
+- **别用 `luci-app-diskman` 改 `/etc/config/fstab`**：它可能改写掉 extroot 那一段，导致下次开机不挂 p3。
+- `-n` 是「不保存配置」：会丢掉 `/etc` 下的一切（它们都在 `@overlay` 上），通常不要用。
+- `-k` 不是「保留分区」，只是把已装包清单附进备份，与 p3 无关。
+- 本固件**不含 `owut`**：它会用服务器重建的镜像覆盖系统，那个镜像不带本仓库的定制；升级请重跑流水线后按上面刷。
+
+升级后自检（三条都应通过）：
+
+```sh
+grep -E ' /overlay ' /proc/mounts          # 仍是 btrfs
+btrfs subvolume list /overlay              # 仍能看到 @overlay/@docker/@swap/@data
+mount | grep -E '/opt/docker|/data'        # docker 与个人数据都还在
+```
+
+## 10. 恢复出厂
+
+**`firstboot` / `jffs2reset` 在本固件无效**，别用：fstools 的恢复出厂只重置「未被挂载的 `rootfs_data`」，
+而本固件把写层搬到了 p3，`rootfs_data` 根本没被挂载 —— 它们会报成功但什么都没删（账号、密钥、装过的包都还在）。
+
+用本仓库自带的命令：
+
+```sh
+overlay-reset            # 只打印计划：会删什么、有多少条、当前写层是什么文件系统
+overlay-reset --yes      # 真删：清空 /overlay/upper（含隐藏文件）→ sync → 重启 = 恢复出厂
+```
+
+- 清的是**系统层可写差异**（`/overlay/upper`）：配置、密钥、装过的包全部回到出厂状态；
+- **不动** `@docker`、`@swap`、`@data`（容器数据、swapfile、个人文件保留）；
+- 要连容器数据一起清，只能重刷镜像（整盘写入）。
+
+重刷也是恢复出厂，且更彻底（连 p3 一起重建）：
+
+```sh
+gunzip -c 新镜像.img.gz | dd of=/dev/nvme0n1 bs=4M status=progress conv=fsync
+```
+
+## 11. 首次登录检查清单
 
 ```sh
 ip -o link show | grep eth          # 看端口顺序
 ip -br addr show                    # br-lan 是否 192.168.100.1/24
 uci show network.wan.proto          # 应为 none（还没配认证）
 uci show network.lan.ipaddr
-df -h / && free -m
+grep -E ' /overlay ' /proc/mounts    # 应为 btrfs（写层已迁到 p3）
+df -h /overlay && free -m
 ```
 
+- [ ] 首启已经自动重启过一次（`/proc/mounts` 里 `/overlay` 是 btrfs）
 - [ ] root 密码已设置
 - [ ] 端口角色与机壳丝印对得上（见 [network.md](network.md)）
-- [ ] 根分区已扩容（否则先别开 docker）
+- [ ] `/overlay` 在 btrfs 子卷上，`@docker`/`@swap`/`@data` 都已挂载（第 5 节四条命令）
 - [ ] 备份一份配置：`sysupgrade -b /tmp/config-$(date +%F).tar.gz`，再 `scp` 到电脑

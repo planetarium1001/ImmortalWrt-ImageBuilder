@@ -2,7 +2,9 @@ autoreboot
 bash
 bind-dig
 blockdev
+btrfs-progs
 ca-bundle
+chattr
 conntrack
 curl
 docker
@@ -12,6 +14,7 @@ dumpe2fs
 e2fsprogs
 ethtool-full
 fdisk
+gdisk
 htop
 iftop
 ip-full
@@ -19,6 +22,7 @@ iperf3
 irqbalance
 jq
 kmod-br-netfilter
+kmod-fs-btrfs
 kmod-inet-diag
 kmod-nf-nathelper-extra
 kmod-nft-socket
@@ -27,6 +31,7 @@ kmod-tcp-bbr
 kmod-tun
 kmod-zram
 lm-sensors
+lsattr
 lsof
 luci-app-argon-config
 luci-app-autoreboot

@@ -24,10 +24,10 @@
 
 | 文档 | 内容 |
 |---|---|
-| [install.md](install.md) | 刷写、首次启动、进入后台、扩容 |
+| [install.md](install.md) | 刷写、首启建 p3 并重启、进入后台、升级与恢复出厂 |
 | [ruijie.md](ruijie.md) | minieap 配置与认证排障 |
 | [network.md](network.md) | 端口顺序、AP 模式、NAT66、网段 |
-| [ops.md](ops.md) | 认证与地址、swap、数据盘与 docker、备份回滚 |
+| [ops.md](ops.md) | 认证与地址、swap、数据盘与 docker、备份回滚（含 `/data` 与 `/mnt/data` 分工） |
 | [packages.md](packages.md) | 内置软件清单与上游链接 |
 | [compliance.md](compliance.md) | 使用条款与责任声明 |
 

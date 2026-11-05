@@ -1,0 +1,52 @@
+#!/bin/sh
+# /lib/preinit/79-btrfs —— preinit 阶段先把 btrfs 模块加载好
+#
+# 为什么必须排在 80_mount_root 之前：
+#   /etc/preinit 先按字典序 `.` 掉 /lib/preinit/*（此时 boot_hook_add 只是追加注册），
+#   随后 boot_run_hook preinit_main 按注册顺序执行钩子。上游 80_mount_root 的钩子里会走
+#   do_mount_root → mount_root start → mount_extroot → `/sbin/block extroot`，而 block 靠
+#   /proc/filesystems 判断能不能挂 btrfs。kmod-fs-btrfs 自带的 /etc/modules.d/ 自动加载
+#   要等 /etc/init.d/boot 才发生，那是 preinit 之后了。所以必须在这里自己先加载，否则
+#   extroot 找不到 btrfs，写层只会静默退回 p2 内部 overlay（系统能起，但 p3 上的
+#   @overlay 用不上）。
+#   排序依据：`-`(0x2D) < `_`(0x5F)，故 79-btrfs 字典序在 79_move_config 与 80_mount_root
+#   之前。改名会破坏这个前提 —— shell/tests/btrfs-preinit-order.sh 会因此变红。
+#
+# 被 source 时必须没有任何副作用（不阻塞、不重启系统、不写文件、不加载模块）；
+# 真正的动作全部留给 boot_run_hook preinit_main，顺序才可控、也才好离线测。
+
+# preinit 早期 syslog 守护常还没起来，故优先写内核环形缓冲（/dev/kmsg），退化为 logger，
+# 两者都不可用时静默丢弃 —— 记日志失败本身绝不能影响启动。
+# 路径可用 PREINIT_KMSG 覆盖（给离线用例注入）。
+preinit_btrfs_log() {
+	_kmsg=${PREINIT_KMSG:-/dev/kmsg}
+	if [ -w "$_kmsg" ]; then
+		printf '<4>79-btrfs: %s\n' "$*" >"$_kmsg" 2>/dev/null && return 0
+	fi
+	if command -v logger >/dev/null 2>&1; then
+		logger -t preinit -p daemon.warn "79-btrfs: $*" 2>/dev/null && return 0
+	fi
+	return 0
+}
+
+# 只加载 btrfs 一个模块。固件里 `modprobe` 就是 /sbin/modprobe → ubox kmodloader：它扫
+# /lib/modules/$(uname -r) 并 mmap .ko 直接取依赖，只读根下也能用，不需要可写缓存。
+# 这里不写绝对路径，是为了让离线用例能把桩放进 PATH 驱动同一个调用点；preinit 的 PATH
+# 含 /sbin，实机解析到的仍是 /sbin/modprobe，与 kmodloader 是同一个实现。
+preinit_btrfs_load() {
+	_procfs=${PROC_FILESYSTEMS:-/proc/filesystems}
+	# 幂等：btrfs 已在 /proc/filesystems 里（钩子被重复执行，或内核已内置）就不再加载
+	if [ -r "$_procfs" ] && grep -qs btrfs "$_procfs"; then
+		return 0
+	fi
+	if modprobe btrfs 2>/dev/null; then
+		preinit_btrfs_log "btrfs loaded before extroot"
+		return 0
+	fi
+	# 加载失败只应退化为「写层走 p2 内部 overlay」，绝不能让 preinit 中断：整个系统起不来
+	# 的代价远大于没有 p3 写层。所以这里永远 return 0，只留一条日志。
+	preinit_btrfs_log "WARN: loading btrfs failed; extroot falls back to p2 internal overlay"
+	return 0
+}
+
+boot_hook_add preinit_main preinit_btrfs_load

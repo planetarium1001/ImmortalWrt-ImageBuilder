@@ -3,22 +3,119 @@
 #   swapctl apply            按 /etc/config/swap 创建并启用
 #   swapctl status           当前 swap 使用
 #   swapctl resize 8192      调整到 8192MB
-CONF=/etc/config/swap
+#
+# 为什么 apply 的步骤顺序是硬约束（btrfs 写层）：
+#   ① @swap 子卷必须已挂载：目录不存在就报错退出，**绝不** mkdir —— 否则 swapfile 会落进
+#      p2 的内部 overlay，看着"成功"，重启后消失，还会把内存层写满。
+#   ② 先建空文件、置 chattr +C，再分配数据：NOCOW 只对之后分配的 extent 生效；
+#      内核 fs/btrfs/inode.c 拒绝 compressed / CoW / 有 csum / 有洞的文件当 swap。
+#   ③ swapon 成功之后才写 /etc/fstab：坏 swapfile 写进 fstab 会让每次开机都报错。
+#   ④ 任一步失败都删掉本次刚建的文件，不留半成品。
+#
+# 测试可注入：PROC_MOUNTS / PROC_SWAPS 默认就是真机的 /proc/mounts、/proc/swaps。
+# 不用 findmnt —— 25.12.2 的 x86_64 源里根本没有这个包。
+PROC_MOUNTS=${PROC_MOUNTS:-/proc/mounts}
+PROC_SWAPS=${PROC_SWAPS:-/proc/swaps}
 cfg() { uci -q get "swap.globals.$1" 2>/dev/null; }
+
+# 尺寸必须是正整数：`size_mb=4g` 这种会直接进 $((size + 64))，
+# ash 会以"值对于底数而言过大"中止并留下一个半死不活的退出码 —— 必须先校验。
+num_ok() {
+	case "$1" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -gt 0 ] 2>/dev/null
+}
+
+# 目录所在挂载的 fstype（取最长前缀匹配的挂载点）
+fstype_of() {
+	awk -v d="$1" '
+		BEGIN { best = ""; type = "" }
+		{
+			m = $2
+			gsub(/\\040/, " ", m)
+			cand = 0
+			if (m == "/") cand = 1
+			else if (m == d || index(d, m "/") == 1) cand = 1
+			if (cand && length(m) > length(best)) { best = m; type = $3 }
+		}
+		END { if (type != "") print type }' "$PROC_MOUNTS" 2>/dev/null
+}
+
+swap_active() { grep -q "^$1 " "$PROC_SWAPS" 2>/dev/null; }
 
 apply() {
 	[ "$(cfg enabled)" = "0" ] && { echo "swap disabled"; return 0; }
-	file=$(cfg file); [ -n "$file" ] || file=/swapfile
+	file=$(cfg file); [ -n "$file" ] || file=/swap/swapfile
 	size=$(cfg size_mb); [ -n "$size" ] || size=4096
-	sw=$(cfg swappiness); [ -n "$sw" ] || sw=20
-
-	# 只写系统盘根分区；数据盘由用户自行挂载，不在这里猜路径
-	if [ ! -f "$file" ]; then
-		fallocate -l "${size}M" "$file" 2>/dev/null || dd if=/dev/zero of="$file" bs=1M count="$size" status=none
-		chmod 600 "$file"
-		mkswap "$file" >/dev/null 2>&1
+	if ! num_ok "$size"; then
+		echo "swapctl: @swap 的 size_mb 必须是正整数兆字节（当前 [$size]），未做任何改动" >&2
+		return 1
 	fi
-	swapon "$file" 2>/dev/null
+	sw=$(cfg swappiness); [ -n "$sw" ] || sw=20
+	dir=$(dirname "$file")
+
+	# ① @swap 必须已挂上（目录由 btrfs-subvols 挂出来，不在这里造）
+	if [ ! -d "$dir" ]; then
+		echo "swapctl: 目录 $dir 不存在——@swap 子卷未挂载；先挂好 @swap 再执行 apply" >&2
+		return 1
+	fi
+
+	created=0
+	if [ ! -f "$file" ]; then
+		# ② 空间检查：size + 64MiB 预留，不够就不建文件、不写 fstab
+		avail=$(df -m "$dir" 2>/dev/null | awk 'END { print $4 }')
+		need=$((size + 64))
+		case "$avail" in
+		'' | *[!0-9]*)
+			echo "swapctl: 读不到 $dir 的可用空间（df -m 无输出）" >&2
+			return 1
+			;;
+		esac
+		if [ "$avail" -lt "$need" ]; then
+			echo "swapctl: $dir 仅剩 ${avail}MiB，需要 ${need}MiB（${size}+64 预留），未创建 swapfile" >&2
+			return 1
+		fi
+
+		# ③ 先建空文件，btrfs 上先置 NOCOW，再写数据
+		: >"$file" 2>/dev/null || {
+			echo "swapctl: 无法创建 $file" >&2
+			return 1
+		}
+		created=1
+		chmod 600 "$file" 2>/dev/null
+		if [ "$(fstype_of "$dir")" = "btrfs" ]; then
+			case "$(lsattr -d "$file" 2>/dev/null | awk '{ print $1 }')" in
+			*C*) ;;
+			*)
+				if ! chattr +C "$file" 2>/dev/null; then
+					echo "swapctl: chattr +C $file 失败（btrfs swapfile 必须 NOCOW）" >&2
+					rm -f "$file"
+					return 1
+				fi
+				;;
+			esac
+		fi
+
+		# ④ 分配 + mkswap；失败清掉自己刚建的半成品
+		if ! {
+			fallocate -l "${size}M" "$file" 2>/dev/null ||
+				dd if=/dev/zero of="$file" bs=1M count="$size" status=none 2>/dev/null
+		} || ! mkswap "$file" >/dev/null 2>&1; then
+			echo "swapctl: 创建 swapfile $file 失败，已清理" >&2
+			rm -f "$file"
+			return 1
+		fi
+	fi
+
+	# ⑤ 启用；成功（或本来就在用）之后才写 fstab
+	if ! swap_active "$file" && ! swapon "$file" 2>/dev/null; then
+		if ! swap_active "$file"; then
+			echo "swapctl: swapon $file 失败" >&2
+			[ "$created" = "1" ] && rm -f "$file"
+			return 1
+		fi
+	fi
 
 	# zram：压缩内存当 swap 用，4G 内存的机器上比多加磁盘 swap 收益大得多
 	if [ "$(cfg zram)" = "1" ]; then
@@ -30,10 +127,14 @@ apply() {
 			echo "zram-swap 未安装，跳过（PACKAGES 里应有 zram-swap）"
 		fi
 	fi
-	echo "vm.swappiness=$sw" >/etc/sysctl.d/99-swappiness.conf
+	echo "vm.swappiness=$sw" >/etc/sysctl.d/99-swappiness.conf 2>/dev/null
 	sysctl -p /etc/sysctl.d/99-swappiness.conf >/dev/null 2>&1
-	grep -q "^$file" /etc/fstab || echo "$file none swap sw 0 0" >>/etc/fstab
+	# 幂等判断必须**整行**比较：`grep -q "^$file"` 既把路径当正则，又会误命中
+	# /swap/swapfile2 这种同前缀的另一个 swapfile，结果我们这条永远写不进去。
+	_fstab_line="$file none swap sw 0 0"
+	grep -qxF "$_fstab_line" /etc/fstab 2>/dev/null || echo "$_fstab_line" >>/etc/fstab
 	echo "swapfile $file ${size}MB active"
+	return 0
 }
 
 status() {
@@ -45,7 +146,20 @@ status() {
 resize() {
 	new=$1
 	[ -n "$new" ] || { echo "usage: swapctl resize <MB>"; exit 2; }
-	file=$(cfg file); [ -n "$file" ] || file=/swapfile
+	# 先校验再动手：坏值写进配置会让之后每次 apply 都失败，
+	# 而那里已经 swapoff + rm -f 过旧文件了 —— 等于纯损失。
+	if ! num_ok "$new"; then
+		echo "swapctl: resize 的尺寸必须是正整数兆字节（当前 [$new]），未做任何改动" >&2
+		return 1
+	fi
+	file=$(cfg file); [ -n "$file" ] || file=/swap/swapfile
+	dir=$(dirname "$file")
+	# 前置检查和 apply 一样：@swap 没挂就先别动。否则 swapoff + rm -f 会把
+	# 当前还能用的 swapfile 删掉，然后 apply 失败 —— 等于纯损失。
+	if [ ! -d "$dir" ]; then
+		echo "swapctl: 目录 $dir 不存在——@swap 子卷未挂载；resize 未做任何改动" >&2
+		return 1
+	fi
 	swapoff "$file" 2>/dev/null
 	rm -f "$file"
 	uci set swap.globals.size_mb="$new"; uci commit swap
@@ -53,8 +167,14 @@ resize() {
 }
 
 case "$1" in
-	apply) apply ;;
+	apply)
+		apply
+		exit $?
+		;;
 	status) status ;;
-	resize) resize "$2" ;;
+	resize)
+		resize "$2"
+		exit $?
+		;;
 	*) echo "usage: swapctl apply|status|resize <MB>" >&2; exit 2 ;;
 esac

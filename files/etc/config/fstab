@@ -1,0 +1,28 @@
+# extroot：把写层搬到 p3 上的 btrfs 子卷 @overlay。
+# 用法（preinit）：mount_root → /sbin/block extroot 读**本文件（squashfs 里的副本）**，
+# 只认 target '/overlay' 且带 extroot 标记的段，再 fopivot 到 /overlay。
+#
+# 两条硬约束（改本文件前务必读 design §3/§4）：
+# 1) **只能有一段 config mount**。block.c 用 vlist_add(&mounts, &m->node, uuid|label|device)
+#    存段且 mounts_update() 是空函数 ⇒ 同 label/uuid/device 的第二段会静默顶掉第一段。
+#    所以 docker/swap/data 三个子卷**不在本文件**，由 /etc/init.d/btrfs-subvols（START=12）挂载。
+# 2) compress=/space_cache=/discard= 是整个文件系统共享的挂载参数（不能按子卷分开），
+#    只有在**首次挂载**（就是下面这一段）上写才生效；后续挂载只带 noatime,subvol=…。
+#    "某个子卷不 CoW / 不压缩" 只能用 chattr +C 实现。
+#
+# 为什么用 label 而不是设备名或 uuid：SATA / NVMe 命名不同（sda3 vs nvme0n1p3），
+# 而文件系统 UUID 首启 mkfs 才有、无法预烘；label 由 mkfs 时的 -L wrt-overlay 写死。
+
+config global 'global'
+	option anon_mount '0'
+	option auto_mount '1'
+	option auto_swap '1'
+	option delay_root '5'
+	option check_fs '0'
+
+config mount 'overlay'
+	option target '/overlay'
+	option label 'wrt-overlay'
+	option fstype 'btrfs'
+	option options 'subvol=@overlay,noatime,compress=zstd:1,space_cache=v2,discard=async'
+	option enabled '1'

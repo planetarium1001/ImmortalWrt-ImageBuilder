@@ -59,9 +59,11 @@ echo "== 只增不改：新增的 include 段数是 5 =="
 eq "新增 include 段" '5' "$(uci show firewall | grep -c '^firewall\.campus_[a-z]*=include$' || true)"
 
 
-echo "== /etc/config 下只新增 commands（LuCI 按钮），且不覆盖上游配置 =="
-extra=$(ls "$REPO/files/etc/config" 2>/dev/null | grep -vxE 'commands|nikki|swap' | tr '\n' ' ')
-eq "files/etc/config 只含 commands/nikki/swap" '' "$extra"
+echo "== /etc/config 下只新增受控文件，且不覆盖 network/dhcp/firewall =="
+# fstab 是有意新增的：extroot（target=/overlay）必须预烘在 squashfs 里，
+# 否则 sysupgrade 重写 p2 后首启认不出 extroot（见任务 20261105-btrfs-overlay-rootfs design §3）。
+extra=$(ls "$REPO/files/etc/config" 2>/dev/null | grep -vxE 'commands|nikki|swap|fstab' | tr '\n' ' ')
+eq "files/etc/config 只含 commands/nikki/swap/fstab" '' "$extra"
 
 CMD=$REPO/files/etc/config/commands
 if [ -s "$CMD" ]; then

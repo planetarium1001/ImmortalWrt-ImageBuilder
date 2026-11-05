@@ -75,17 +75,42 @@ stage_nikki() {
 		'[ "$(curl -s -o /dev/null -w "%{http_code}" -m 8 https://www.baidu.com)" = 200 ]'
 }
 
+stage_overlay() {
+	echo "== ac-11 btrfs 子卷写层 =="
+	chk "btrfs 模块已加载（/proc/filesystems 有 btrfs）" 'grep -qw btrfs /proc/filesystems'
+	chk "/overlay 的 fstype 是 btrfs" '[ "$(awk \'\''$2=="/overlay"{print $3}'\'' /proc/mounts)" = btrfs ]'
+	chk "/overlay 挂的是子卷 @overlay" 'grep -q "subvol=@overlay\|subvolid=" /proc/mounts && btrfs subvolume show /overlay 2>/dev/null | grep -q "Name:.*@overlay\|@overlay"'
+	# 注意：/ 是 overlayfs，df / 与 df /overlay 是同一个 btrfs 池，两者相等恒真（审计点名）。
+	# 改与**整盘**容量比：p3 应占满除 p1(32MiB)+p2(512MiB) 之外的盘尾。
+	chk "/overlay 至少用到整盘的 90%（p3 已扩满）" \
+		'ov=$(df -Pm /overlay | awk "NR==2{print \$2}"); dev=$(awk "\$2==\"/overlay\"{print \$1}" /proc/mounts); d=$(basename "$dev" | sed "s/p\{0,1\}[0-9]*$//"); sz=$(cat /sys/class/block/"$d"/size 2>/dev/null); [ -n "$sz" ] && [ "$ov" -ge $(( sz / 2048 * 90 / 100 )) ]'
+	chk "btrfs 上有 @overlay/@docker/@swap 三个子卷" \
+		'btrfs subvolume list /overlay 2>/dev/null | grep -q @overlay && btrfs subvolume list /overlay 2>/dev/null | grep -q @docker && btrfs subvolume list /overlay 2>/dev/null | grep -q @swap'
+	chk "@docker 挂在 /opt/docker" 'awk "\$2==\"/opt/docker\"{f=1} END{exit !f}" /proc/mounts'
+	chk "@swap 挂在 /swap" 'awk "\$2==\"/swap\"{f=1} END{exit !f}" /proc/mounts'
+	chk "@data 挂在 /data" 'awk "\$2==\"/data\"{f=1} END{exit !f}" /proc/mounts'
+	chk "/opt/docker 与 /swap 根目录带 NOCOW（C）标志" \
+		'lsattr -d /opt/docker 2>/dev/null | grep -q C && lsattr -d /swap 2>/dev/null | grep -q C'
+	chk "swapfile 在 /swap/swapfile 且已启用" 'swapon 2>/dev/null | grep -q "/swap/swapfile"'
+	# 出厂值是 "/opt/docker/"（带尾斜杠），等值比较会假红
+	chk "docker data_root 指向 /opt/docker" \
+		'! command -v dockerd >/dev/null 2>&1 || [ "$(uci -q get dockerd.globals.data_root | sed "s:/*$::")" = /opt/docker ]'
+	chk "首启日志无 extroot 失败（近 500 行）" '! logread 2>/dev/null | tail -500 | grep -q "extroot:.*cannot find device"'
+}
+
 case "${1:-all}" in
 cold-boot) stage_cold_boot ;;
 dual-stack) stage_dual_stack ;;
 nikki-whitelist) stage_nikki ;;
+overlay) stage_overlay ;;
 all)
 	stage_cold_boot
 	stage_dual_stack
 	stage_nikki
+	stage_overlay
 	;;
 *)
-	echo "usage: ROUTER=root@<ip> $0 [cold-boot|dual-stack|nikki-whitelist|all]" >&2
+	echo "usage: ROUTER=root@<ip> $0 [cold-boot|dual-stack|nikki-whitelist|overlay|all]" >&2
 	exit 2
 	;;
 esac
