@@ -1,0 +1,16 @@
+# fixture 出处（本文件不是基准本体，只是元信息；基准是 80_mount_root.r38135）
+
+- 来源：N5105 设备的只读基座 `/rom/lib/preinit/80_mount_root`（WAN 侧 SSH 取回；主机地址不在仓库里记录）
+- 版本：ImmortalWrt 25.12.2 r38135
+- 取回日期：2026-11-06
+- 大小：54 行
+- md5：0f35638fbf8b1a18163be5d07e062f73
+- 交叉核对：immortalwrt/openwrt-25.12 的 package/base-files/files/lib/preinit/80_mount_root 逐字一致
+
+## 规矩
+
+- 基准文件必须逐字节等于设备原文，不许夹带任何注释、来源说明或行尾改动。
+  出处信息写在本文件里，不要写进 80_mount_root.r38135。
+  shell/tests/preinit-mount-root.sh 里有一条硬断言按上面这个 md5 校验，
+  任何"顺手加个注释/改个行尾"都会让它变红。
+- 上游这份文件没有 shebang：它只被 /etc/preinit source，不单独执行，不要顺手补 `#!/bin/sh`。

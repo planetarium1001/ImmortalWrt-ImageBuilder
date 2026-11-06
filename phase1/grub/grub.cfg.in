@@ -1,0 +1,62 @@
+# phase1/grub/grub.cfg.in —— Phase 1 引导菜单模板
+#
+# 这是**模板**，不要直接放到 /boot/grub/grub.cfg；用
+#     sh phase1/assemble-image.sh --grub-dir <DIR> --kernel vmlinuz --initrd initrd.cpio.gz [--trial]
+# 渲染（占位符 @NAME@ 全部替换完才会被接受，残留占位符 = 渲染失败）。
+#
+# 占位符：
+#   @TIMEOUT@       等待秒数（默认 3）
+#   @TITLE@         0 号项的标题（已知良好项）
+#   @KERNEL@        0 号项的内核路径（grub 视角，默认 /boot/vmlinuz）
+#   @INITRD@        0 号项的 initrd 路径（grub 视角，默认 /boot/initrd.cpio.gz）
+#   @CMDLINE@       0 号项的 cmdline（逐字可控；由 --cmdline 决定）
+#   @TRIAL_INDEX@   试跑项序号（menuentry 从 0 数，默认 1）
+#   @TRIAL_TITLE@   试跑项标题
+#   @TRIAL_KERNEL@  试跑项内核路径
+#   @TRIAL_INITRD@  试跑项 initrd 路径
+#   @TRIAL_CMDLINE@ 试跑项 cmdline = 0 号项 cmdline + 四个 phase1_* 设备/子卷键
+#
+# 语义（ac-5）：
+#   * 0 号项 = 已知良好项；`set fallback=0` 保证内核/initrd 加载不了时回落到它
+#     （grub 加载失败会停在菜单等按键 = 无人值守时的死等，见设计 §3）。
+#   * 只有 `#@TRIAL_BEGIN@` / `#@TRIAL_END@` 之间那段会在 --trial 渲染时出现：
+#     最终镜像的 grub.cfg 里**没有**试跑项，也就没有标记守卫（不会指向不存在的序号）。
+#   * 真机试跑：在引导分区放一个标记文件（grub 视角 @MARKER@，由渲染时带入 = 默认 /boot/try-phase1），
+#     默认项就切到试跑项；/init 失败时会删掉标记 ⇒ 下次启动自动回 0 号项。
+#   * cmdline 硬规则由 assemble-image.sh 在渲染后校验（不合格直接退出非 0）：
+#     不得出现会让内核无限等待的 `root*`（见 phase1/README.md 的"cmdline 硬规则"），
+#     必须含 fstools_ignore_partname=1 与 panic=10，
+#     不得用 root=PARTUUID= 锚定根（每次构建都会漂移，根由 initrd 决定）。
+
+# 上面这段说明只留在模板里；渲染时会整段丢弃，渲染结果里不会出现这些字样。
+#@TEMPLATE_HEADER_END@
+set timeout=@TIMEOUT@
+set default=0
+set fallback=0
+
+menuentry '@TITLE@' {
+	linux @KERNEL@ @CMDLINE@
+	initrd @INITRD@
+}
+
+#@TRIAL_BEGIN@
+# 真机试跑项：标记文件存在时成为默认项（一次性；删除标记即回 0 号项）。
+# 标记与日志都在**引导分区的 boot/ 子目录**下（PRD 硬规则 15 / F-1）：
+#   live 视图      /boot/try-phase1      （p1 挂到 /boot 后再把 p1:/boot bind 到 /boot）
+#   GRUB 视图      /boot/try-phase1      （grub root = p1 根 ⇒ p1:/boot/try-phase1）
+#   initramfs 里   <p1>/<bootsub>/try-phase1（bootsub = phase1_bootsub cmdline 键）
+# 三者是同一个文件。主守卫取与 live /boot 一致的那条（引导分区的 boot/ 子目录），另一条只作兜底。
+if [ -f @MARKER@ ]; then
+	set default=@TRIAL_INDEX@
+fi
+#@MARKER_ALT_BEGIN@
+if [ -f @MARKER_ALT@ ]; then
+	set default=@TRIAL_INDEX@
+fi
+#@MARKER_ALT_END@
+
+menuentry '@TRIAL_TITLE@' {
+	linux @TRIAL_KERNEL@ @TRIAL_CMDLINE@
+	initrd @TRIAL_INITRD@
+}
+#@TRIAL_END@

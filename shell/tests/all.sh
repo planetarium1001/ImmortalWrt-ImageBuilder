@@ -4,7 +4,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 fail=0; pending=0
-for t in repo-shape workflows-shape readme-shape readme-flow upstream-readme squashfs-image-config btrfs-packages btrfs-preinit-order btrfs-fstab-config overlay-setup overlay-subvols overlay-reset sysupgrade-layout swapctl-space check-packages uci-fake uci-defaults-idempotent uci-defaults-nic minieap-native nikki-feed check-static no-site-words no-legacy-config no-extra-modules no-override-config no-rename no-iptables netports-truth netports-fail-closed nicsync nicsync-idempotent nicsync-warn ipv6mode ipv6mode-memory netprofile-switch netprofile-memory netprofile-templates netprofile-render netprofile-rollback minieap-empty-conf minieap-skip wan-auto hostname docs-native docs-nic docs-auth docs-profile nat66-native no-auto-disk docs-complete docs-overlay campus-include-values shell-portability campus-rules-scope device-verify device-upgrade-check; do
+for t in repo-shape workflows-shape readme-shape readme-flow upstream-readme squashfs-image-config btrfs-packages btrfs-preinit-order btrfs-fstab-config overlay-setup overlay-subvols overlay-reset sysupgrade-layout swapctl-space check-packages uci-fake uci-defaults-idempotent uci-defaults-nic minieap-native nikki-feed check-static no-site-words no-legacy-config no-extra-modules no-override-config no-rename no-iptables netports-truth netports-fail-closed nicsync nicsync-idempotent nicsync-warn ipv6mode ipv6mode-memory netprofile-switch netprofile-memory netprofile-templates netprofile-render netprofile-rollback minieap-empty-conf minieap-skip wan-auto hostname docs-native docs-nic docs-auth docs-profile nat66-native no-auto-disk docs-complete docs-overlay campus-include-values shell-portability campus-rules-scope device-verify device-upgrade-check preinit-mount-root; do
 	sh "$ROOT/shell/tests/$t.sh" >/tmp/t.out 2>&1
 	rc=$?
 	case $rc in
@@ -13,6 +13,24 @@ for t in repo-shape workflows-shape readme-shape readme-flow upstream-readme squ
 		*) echo "FAIL  $t"; sed 's/^/      /' /tmp/t.out | tail -12; fail=$((fail+1)) ;;
 	esac
 done
+# phase1/ 下的离线用例（Phase 1 引导链；不依赖实机）
+for t in init-semantics make-initramfs-static grub-cfg assemble-dry-run; do
+	sh "$ROOT/phase1/tests/$t.sh" >/tmp/t.out 2>&1
+	rc=$?
+	case $rc in
+		0) echo "PASS  phase1/$t" ;;
+		2) echo "PEND  phase1/$t"; sed 's/^/      /' /tmp/t.out | tail -3; pending=$((pending+1)) ;;
+		*) echo "FAIL  phase1/$t"; sed 's/^/      /' /tmp/t.out | tail -12; fail=$((fail+1)) ;;
+	esac
+done
+# phase1/tools/device-verify.sh：真机判据复核（无 ROUTER 时 PEND；--collected 需要归档证据）
+ROUTER=${ROUTER:-} sh "$ROOT/phase1/tools/device-verify.sh" >/tmp/t.out 2>&1
+rc=$?
+case $rc in
+	0) echo "PASS  phase1/tools/device-verify" ;;
+	2) echo "PEND  phase1/tools/device-verify"; sed 's/^/      /' /tmp/t.out | tail -3; pending=$((pending+1)) ;;
+	*) echo "FAIL  phase1/tools/device-verify"; sed 's/^/      /' /tmp/t.out | tail -12; fail=$((fail+1)) ;;
+esac
 echo "---"
 echo "fail=$fail pending=$pending"
 [ $fail -gt 0 ] && exit 1

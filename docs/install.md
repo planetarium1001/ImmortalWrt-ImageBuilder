@@ -324,3 +324,57 @@ df -h /overlay && free -m
 - [ ] 端口角色与机壳丝印对得上（见 [network.md](network.md)）
 - [ ] `/overlay` 在 btrfs 子卷上，`@docker`/`@swap`/`@data` 都已挂载（第 5 节四条命令）
 - [ ] 备份一份配置：`sysupgrade -b /tmp/config-$(date +%F).tar.gz`，再 `scp` 到电脑
+
+---
+
+## 附录 A：Phase 1（只读 btrfs 子卷根）—— 构建链与真机试跑（**尚未成为默认刷写路径**）
+
+> 状态（2026-11-06）：引导链已在本机真机用 GRUB 路径验证；**整盘重分区与刷机尚未验证**，装机脚本只到 `--dry-run`。
+> 全部细节以 [`../phase1/README.md`](../phase1/README.md) 为准，本节只说明它与现有刷写流程的关系。
+
+### A.1 与本文主流程的区别
+
+| 项 | 主流程（当前发布镜像） | Phase 1 |
+|---|---|---|
+| 根 | p2 的 squashfs 只读分区 | p2 btrfs 的**只读子卷 `@root`** |
+| 写层 | p3 btrfs 子卷 `@overlay`，由 fstools extroot 挂上 | 同一份 `@overlay`，但由 **initramfs** 在切根前挂好 |
+| 引导 | GRUB → 内核直接挂 squashfs 根 | GRUB → 内核 → **initramfs**（`rdinit=/init`）→ 合成 overlay → `switch_root` |
+| 基座更新 | `sysupgrade` 写 p1+p2 | 直接换 `@root` 子卷（Phase 2） |
+| 额外子卷 | `@overlay` `@docker` `@swap` `@data` | `@root` `@overlay` `@docker` `@swap`（`@docker`/`@swap` 是功能前提，不是可选项） |
+
+### A.2 为什么基座里多了一个 `/lib/preinit/80_mount_root`
+
+fstools 的 `mount_root` 在找不到 `rootfs_data` 时会走 `ramoverlay()`，用 **tmpfs** 顶掉写层并叠在我们合成的根上——系统照常启动，但所有写入进 RAM，重启即失。
+因此 `files/lib/preinit/80_mount_root` 覆盖上游同名文件：**只有当 `/` 已是 overlay 且 `lowerdir=/lower`、`upperdir=/overlay/upper` 同时成立时才跳过 `do_mount_root`**，其余情况与上游逐字一致（含 `$INITRAMFS` 守卫、`preinit_mount_root` 钩子、sysupgrade 配置恢复）。
+
+这条差异对现有 squashfs 构建**无影响**：preinit 时 `/` 是 squashfs，判定不成立，行为等于上游。
+真机取证可看 `dmesg | grep 80_mount_root`。
+
+### A.3 试跑步骤（真机，GRUB 路径）
+
+```sh
+# 1) 构建 initrd（在开发机上，STAGE 是设备文件树）
+STAGE=/path/to/stage sh phase1/make-initramfs.sh --out /tmp/phase1-initrd.cpio.gz
+# 2) 渲染 grub.cfg：保留现有 live 项逐字不动，末尾追加"标记存在时生效"的试跑项
+sh phase1/assemble-image.sh --grub-dir /tmp/p1grub \
+  --preserve-existing /tmp/device-grub.cfg --trial \
+  --rootdev /dev/nvme0n1p3 --bootdev /dev/nvme0n1p1 \
+  --lower-subvol @root --overlay-subvol @overlay \
+  --kernel-path /boot/vmlinuz --trial-initrd /boot/phase1-initrd.cpio.gz
+# 3) 上机：把 initrd 与 grub.cfg 放到引导分区，然后
+touch /boot/try-phase1 && sync && reboot
+```
+
+试跑标记是**一次性**的：`/init` 无论成功还是失败都会删掉它，失败时还会把原因写进 `/boot/phase1-boot.log` 并强制重启回 live 系统。
+想再试一次就重新 `touch /boot/try-phase1`。
+
+### A.4 判据（怎么算过）
+
+```sh
+awk '$2=="/"' /proc/mounts      # 期望含 lowerdir=/lower 与 upperdir=/overlay/upper
+awk '$2=="/rom"' /proc/mounts   # 期望 subvol=/@root 且 ro
+cat /boot/phase1-boot.log       # 期望有 "initramfs: switching root upperdir=/overlay/upper"
+dmesg | grep -i 'tmpfs overlay' # 期望为空
+```
+
+注意：**现网 extroot 系统的 `/` 行同样含 `upperdir=/overlay/upper`**（`lowerdir=/`），所以只看 `upperdir` 会把 live 误判成通过；必须连 `lowerdir=/lower` 一起看。

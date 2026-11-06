@@ -1,0 +1,151 @@
+# Copyright (C) 2006 OpenWrt.org
+# Copyright (C) 2010 Vertical Communications
+#
+# ==== 本仓库对上游的唯一偏离（除此之外本文与上游 base-files 逐字相同）====
+#
+# 为什么要这枚补丁：fstools 找不到 rootfs_data 时走
+#   mount_root.c start(): volume_identify(data) == FS_NONE → ramoverlay()
+# 而 ramoverlay()（libfstools/mount.c，fstools 16718b6）先 mount tmpfs 到 /tmp/root，再
+#   fopivot("/tmp/root", "/rom")
+# fopivot 的 lowerdir 取的是"当前根本身"，也就是我们 initramfs 合成好的 overlay。
+# 结果：系统照常启动、看起来一切正常，但写层变成 tmpfs —— 所有写入进 RAM，重启即失
+# （假阳性；线上表现就是"改了配置重启就没了"）。所以必须在 preinit 阶段拦住 mount_root。
+#
+# 判定（preinit_mount_root_is_ours）只读 /proc/mounts 的 `/` 行，三条同时成立才算"我们的根"：
+#   $2 == "/"、$3 == "overlay"、选项串里同时含 lowerdir=/lower 与 upperdir=/overlay/upper。
+# 为什么必须同时要 lowerdir=/lower：现网 fstools extroot 的 / 行同样含 upperdir=/overlay/upper，
+# 真机原文是
+#   overlayfs:/overlay / overlay rw,noatime,lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work,xino=off
+# 只按 upperdir 判就会把"fstools 自己合成的根"误认成我们的、静默不挂写层；而我们的 initramfs
+# 约定的 lower 挂载点是 /lower（phase1/initramfs/init 里
+# lowerdir=/lower,upperdir=/overlay/upper,workdir=/overlay/work），extroot 的 lowerdir=/ 命中不了，
+# 故"误跳过 mount_root"的窗口为零。读不到 /proc/mounts、或里面没有 / 行时一律退回上游行为
+# （照常注册钩子）—— 判定不出来时"不动"才是安全的默认。
+# 不访问 /overlay/upper 路径本身：switch_root 之后它不可达（决策硬规则 9 / §N.5），唯一可信的
+# 判据是内核存进 /proc/mounts 的那串 overlay 选项。
+#
+# 为什么不用上游自带的 $INITRAMFS=1 机制代替这枚补丁：/lib/preinit/70_initramfs_test 在
+# $INITRAMFS 非空时执行 boot_run_hook initramfs + preinit_ip_deconfig 再 break，会把
+# preinit_main 里剩下所有钩子一起跳过 —— 包括 81_urandom_seed、82_config_generate
+# （首启 uci-defaults 配置生成）。那会让首启配置生成落空，代价远大于收益。
+# 所以这里只精确跳过 do_mount_root 一个钩子，上游的 $INITRAMFS 守卫原样保留。
+#
+# 本模式的已知差异（Phase 1 明确接受；写在这里备查，不要以为漏了）：
+#   根是我们合成的 overlay 时，下列上游动作不会发生 ——
+#     · mount_root start ...              （写层由 initramfs 在 switch_root 之前挂好）
+#     · boot_run_hook preinit_mount_root  （79_move_config / 20_check_iso 等钩子不跑）
+#     · sysupgrade 配置恢复（/sysupgrade.tgz、/tmp/sysupgrade.tar 那一段）
+#   Phase 1 明确绕开 sysupgrade，配置恢复属升级路径，不在本轮范围。
+#     · /etc/config/fstab 里的挂载参数（compress=zstd:1 / space_cache=v2 / discard=async）
+#       —— initramfs 自己以 compress=zstd:1 挂 rw 子卷（@overlay/@docker/@swap），
+#          mount -o move / bind 保留该挂载选项 ⇒ 新系统里 /overlay 继承压缩设置；
+#          上游由 fstab 决定，而本模式的基座没有 fstab（Phase 1 明确接受）。
+#
+# 被 /etc/preinit source 时不得有任何副作用：只做判定与钩子注册，不挂载、不写文件、不阻塞、
+# 不重启。判定路径可用 PROC_MOUNTS 注入、日志路径可用 PREINIT_KMSG 注入（给离线用例）。
+
+missing_lines() {
+	local file1 file2 line
+	file1="$1"
+	file2="$2"
+	oIFS="$IFS"
+	IFS=":"
+	while read line; do
+		set -- $line
+		grep -q "^$1:" "$file2" || echo "$line"
+	done < "$file1"
+	IFS="$oIFS"
+}
+
+# Rootfs mount options can be passed by declaring in the kernel
+# cmdline as much options as needed prefixed with "rootfs_mount_options."
+#
+# Example:
+# rootfs_mount_options.compress_algorithm=zstd rootfs_mount_options.noinline_data
+#
+compose_rootfs_mount_options() {
+	local mount_options
+	local cmdlinevar
+
+	for cmdlinevar in $(cat /proc/cmdline); do
+		if [ "$cmdlinevar" != "${cmdlinevar#rootfs_mount_options\.}" ]; then
+			append mount_options "${cmdlinevar#rootfs_mount_options\.}"
+		fi
+	done
+
+	echo $mount_options
+}
+
+do_mount_root() {
+	mount_root start "$(compose_rootfs_mount_options)"
+	boot_run_hook preinit_mount_root
+	[ -f /sysupgrade.tgz -o -f /tmp/sysupgrade.tar ] && {
+		echo "- config restore -"
+		cp /etc/passwd /etc/group /etc/shadow /tmp
+		cd /
+		[ -f /sysupgrade.tgz ] && tar xzf /sysupgrade.tgz
+		[ -f /tmp/sysupgrade.tar ] && tar xf /tmp/sysupgrade.tar
+		missing_lines /tmp/passwd /etc/passwd >> /etc/passwd
+		missing_lines /tmp/group /etc/group >> /etc/group
+		missing_lines /tmp/shadow /etc/shadow >> /etc/shadow
+		rm /tmp/passwd /tmp/group /tmp/shadow
+		# Prevent configuration corruption on a power loss
+		sync
+	}
+}
+
+# preinit 早期 syslog 守护常常还没起来，故优先写内核环形缓冲（/dev/kmsg），退化为 logger，
+# 两者都不可用时静默丢弃 —— 记日志失败本身绝不能影响启动。
+# 文本固定带 "skip fstools mount_root" 与 upperdir 字样，便于 dmesg | grep 80_mount_root 取证。
+# 路径可用 PREINIT_KMSG 覆盖（给离线用例注入）。
+preinit_mount_root_log() {
+	_kmsg=${PREINIT_KMSG:-/dev/kmsg}
+	if [ -w "$_kmsg" ]; then
+		printf '<4>80_mount_root: %s\n' "$*" >"$_kmsg" 2>/dev/null && return 0
+	fi
+	if command -v logger >/dev/null 2>&1; then
+		logger -t preinit -p daemon.warn "80_mount_root: $*" 2>/dev/null && return 0
+	fi
+	return 0
+}
+
+# 单条挂载记录的判定。<挂载点> <类型> <选项串>
+# 选项串两侧补逗号做锚后逐项比对，避免 lowerdir=/lowerX 之类近似串误命中；
+# lowerdir=/lower: 也接受，允许 /lower 是多 lower 列表的第一项。
+preinit_mount_root_line_is_ours() {
+	[ "${1:-}" = "/" ] || return 1
+	[ "${2:-}" = "overlay" ] || return 1
+	case ",${3:-}," in
+	*,lowerdir=/lower,*|*,lowerdir=/lower:*) ;;
+	*) return 1 ;;
+	esac
+	case ",${3:-}," in
+	*,upperdir=/overlay/upper,*) ;;
+	*) return 1 ;;
+	esac
+	return 0
+}
+
+# 读 /proc/mounts 找 `/` 行。路径可用 PROC_MOUNTS 覆盖（给离线用例注入，绝不碰真 /proc）。
+# 读不到文件、或里面没有 / 行 ⇒ 返回 1（不是我们的根）⇒ 与上游一样注册钩子。
+preinit_mount_root_is_ours() {
+	_mounts=${PROC_MOUNTS:-/proc/mounts}
+	[ -r "$_mounts" ] || return 1
+	while read -r _mr_dev _mr_mp _mr_type _mr_opts _mr_rest; do
+		if preinit_mount_root_line_is_ours "$_mr_mp" "$_mr_type" "$_mr_opts"; then
+			return 0
+		fi
+	done <"$_mounts"
+	return 1
+}
+
+# 上游那行守卫原样保留（$INITRAMFS=1 时上游本就不跑 mount_root）；只在"否则"分支里加了
+# 判定：根已是我们合成的 overlay 就精确跳过 do_mount_root 一个钩子。
+[ "$INITRAMFS" = "1" ] || {
+	if preinit_mount_root_is_ours; then
+		# 写层已由 initramfs 挂好，绝不能让 ramoverlay() 用 tmpfs 叠在我们的根之上
+		preinit_mount_root_log "skip fstools mount_root: / is overlay lowerdir=/lower,upperdir=/overlay/upper (initramfs-composed root)"
+	else
+		boot_hook_add preinit_main do_mount_root
+	fi
+}

@@ -1,0 +1,18 @@
+serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1 --rtscts=off
+terminal_input console serial; terminal_output console serial
+
+set default="0"
+set timeout="0"
+search -l kernel -s root
+
+menuentry "ImmortalWrt" {
+	linux /boot/vmlinuz root=PARTUUID=00000000-0000-4000-8000-000000000001 rootwait  console=tty1 console=ttyS0,115200n8 noinitrd
+}
+menuentry "ImmortalWrt (failsafe)" {
+	linux /boot/vmlinuz failsafe=true root=PARTUUID=00000000-0000-4000-8000-000000000001 rootwait  console=tty1 console=ttyS0,115200n8 noinitrd
+}
+
+menuentry "TEST btrfs subvol root (initramfs)" {
+	linux /boot/vmlinuz root=PARTUUID=00000000-0000-4000-8000-000000000002 rootwait rootfstype=btrfs rootflags=subvol=@root-test rdinit=/init fstools_ignore_partname=1 console=ttyS0,115200n8 console=tty1 panic=10
+	initrd /boot/test-initrd.cpio.gz
+}

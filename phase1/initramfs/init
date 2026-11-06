@@ -1,0 +1,628 @@
+#!/bin/busybox sh
+#
+# phase1/initramfs/init —— Phase 1 引导链的 /init（单文件，busybox ash，POSIX 子集）
+#
+# 干什么：
+#   proc/sys -> tmpfs /dev + mknod -> modprobe btrfs/vfat -> 挂 p1 写持久日志
+#   -> @root **ro** 挂 /lower -> @overlay 挂 /overlay（upper/work）
+#   -> overlay 合成 /newroot -> 写入探针 -> /lower、/overlay 搬进新根（/rom、/overlay）
+#   -> @docker/@swap（存在才挂） -> exec switch_root /newroot /sbin/init
+#
+# 为什么这么写（都踩过，见 .workflow/assets/wrt-ab-00-HANDOFF.md §5）：
+#   * 本内核 CONFIG_DEVTMPFS=n（mount -t devtmpfs 实测 rc=32），所以 /dev 必须 mount -t tmpfs
+#     + 自己 mknod；块设备号优先读 /sys/class/block/<name>/dev（跨次启动不漂移）。
+#   * busybox 没有 insmod/modprobe applet；/sbin/modprobe 是 kmodloader 的软链。
+#     `kmodloader <名字>` 是 rc=0 的静默假成功 ⇒ 只用 /sbin/modprobe，且加载后必须
+#     断言 /proc/modules 里真的出现 btrfs。
+#   * 本 initramfs 不装 applet 软链（PATH 只用于 kmodloader 内部），所以每条命令都写
+#     /bin/busybox <applet>。
+#   * 设备无显示器/键盘/串口 ⇒ 唯一判读手段是 p1 上的持久日志 <p1>/boot/phase1-boot.log。
+#     载荷必须带 vfat/fat/nls_*，否则日志写不出来，表现为"零痕迹"，会被误判成 init 没跑。
+#   * **F-1（真机实测，别再踩）**：p1 根下有自己的 boot/ 目录（内核在 p1:/boot/vmlinuz、grub 配置在
+#     p1:/boot/grub/grub.cfg），live 的 /boot 是 79_move_config 先挂 p1 根再 `--bind /boot/boot`
+#     ⇒ live /boot 实际指向 **p1:/boot**。所以**不能**把 p1 根直接当 /boot：那样标记会落在
+#     p1:/try-phase1、日志落在 p1:/phase1-boot.log，而 GRUB 查的是 p1:/boot/try-phase1 ⇒ 失败路径删
+#     不到标记（无限重启）、成功路径也不消耗标记。正确做法：p1 挂 /p1，标记与日志都在
+#     /p1/<phase1_bootsub>/ 里，于是三个视角指向同一个文件：
+#       GRUB /boot/try-phase1 == p1:/boot/try-phase1 == live /boot/try-phase1 == initramfs /p1/boot/try-phase1
+#   * 失败分支**绝不**落交互 shell（读 tty1 会永久挂死，panic=10 也不会触发）。
+#
+# 试跑标记语义（删标记 = "本次试跑已被消耗"，与"失败"同义）：
+#   失败（die）、卡死（看门狗 150s）、成功切根前 —— 三条路径**都**删
+#   <p1>/<phase1_bootsub>/try-phase1，且共用同一个 drop_trial_marker()。
+#   任何一条路径都只消耗一次机会 ⇒ 不会形成重启循环。
+#   标记的**正常**位置只有一个（见上面的 F-1），删标记在把 p1:/boot 挂进新根**之前**完成。
+#   但"删得掉"这件事**不依赖路径推断正确**：主路径没删到东西时会按 p1 上的
+#   `boot/try-phase1` 与 `try-phase1` 兜底（覆盖 phase1_bootsub 指向存在但非引导目录的情况），
+#   两处都失败才写终态 REMOVE-FAILED。
+#
+# 失败语义（die）：
+#   1) 往 <p1>/<phase1_bootsub>/phase1-boot.log 追加一行 `phase1-init: FAIL stage=<阶段>: <细节>`
+#   2) **删除 <p1>/<phase1_bootsub>/try-phase1 试跑标记**（panic=10 会自动重启，删标记是"下次回 live"的唯一手段）
+#   3) sync; sleep 5; reboot -f
+#   若 p1 还没挂上，die 会先补挂一次（ensure_bootlog）；补挂也失败时标记删不掉，
+#   这时可能形成重启循环 —— 属于已知遗留窗口，日志里会写 `recovery: ... p1 不可用`。
+#
+# 判读字符串（tm-03 按这个 grep <p1>/<phase1_bootsub>/phase1-boot.log）：
+#   `=== phase1-init: start build=`      一次 initramfs 启动的开始
+#   `phase1-init: ok stage=<阶段>`       阶段成功
+#   `phase1-init: FAIL stage=<阶段>: `   失败点（后面跟原始错误）
+#   `phase1-init: recovery: `            标记处理结果（removed / REMOVE-FAILED / 不可用）
+#   `phase1-init: watchdog: fired`       总超时看门狗触发（说明卡在某一步；也会补挂 p1 + 删标记）
+#   `initramfs: switching root upperdir=/overlay/upper`   成功切根那一行
+#
+# 硬约束：
+#   * cmdline **禁 rootwait**（找不到根会无限等待，panic=10 不触发）；命中即 `die cmdline`。
+#   * overlay 参数串必须逐字为
+#         lowerdir=/lower,upperdir=/overlay/upper,workdir=/overlay/work
+#     switch_root 之后 /lower、/overlay 的旧路径不可达（busybox switch_root 是 chroot+删旧根），
+#     运行期判据只能读 /proc/mounts 的 `/` 行 ⇒ 这串字符串是 80_mount_root / mark-good 的唯一判据。
+#   * 搬运挂载优先 `mount -o move`，失败退化"同子卷二次挂载"，两条路都必须过断言。
+#   * rw 的 btrfs 子卷（@overlay/@docker/@swap）统一带 `compress=zstd:1`：跳过 fstools 的
+#     do_mount_root 后没人读 fstab，压缩参数只能在这里给（否则整块盘不带压缩，见审计 M4）。
+#   * **btrfs 挂载参数是 superblock 级，第一次挂载该文件系统时带上的才生效**（之后带 compress=
+#     会被静默忽略）。所以 @overlay **必须**先于 @root 挂；挂完还要从 /proc/mounts 读回断言
+#     ——"代码里有这个字符串"不等于"实际生效"，第三轮真机复验就是这么漏的。
+#
+# 参数：以下默认值由 phase1/make-initramfs.sh 用占位符渲染（键名与 grub 模板一致）。
+#   phase1_dev     根设备              默认 @ROOTDEV@
+#   phase1_boot    p1（vfat）          默认 @BOOTDEV@
+#   phase1_bootsub p1 内的引导目录     默认 @BOOTSUB@（空 = 直接放 p1 根；见 F-1）
+#   phase1_lower   @root 子卷名        默认 @LOWER@
+#   phase1_overlay @overlay 子卷名     默认 @OVL@
+#   另有两个可选键（默认内置，不注入占位符）：phase1_docker=@docker phase1_swap=@swap
+
+PATH=/bin:/sbin
+export PATH
+LD_LIBRARY_PATH=/lib:/usr/lib
+export LD_LIBRARY_PATH
+umask 022
+
+PHASE1_BUILD='phase1-v7'
+
+# ---- 默认值（占位符；渲染后即为具体值） ------------------------------------
+DEF_DEV='@ROOTDEV@'
+DEF_BOOT='@BOOTDEV@'
+DEF_LOWER='@LOWER@'
+DEF_OVL='@OVL@'
+DEF_BOOTSUB='@BOOTSUB@'
+DEF_DOCKER='@docker'
+DEF_SWAP='@swap'
+
+# ---- 固定路径 --------------------------------------------------------------
+P1_NEWROOT='/newroot'
+P1_LOWER_DIR='/lower'
+P1_OVL_DIR='/overlay'
+# p1 挂在这里（**根**，不是 /boot）；标记与日志都在 $P1_BOOT_DIR 下（见头部的 F-1）
+P1_PART_DIR='/p1'
+P1_BOOTSUB=''
+P1_BOOT_DIR=''
+P1_LOG=''
+P1_MARKER=''
+P1_WDT_SECS='150'
+
+# 由 phase1_bootsub 推出三个路径。三种"直放 p1 根"的写法都归一成空串（与
+# assemble-image.sh --boot-subdir '' 的语义一致）。
+set_boot_paths() { # <bootsub>
+	case ${1:-} in
+		''|'.'|'/') P1_BOOTSUB='' ;;
+		*)          P1_BOOTSUB=$1 ;;
+	esac
+	if [ -n "$P1_BOOTSUB" ]; then
+		P1_BOOT_DIR="$P1_PART_DIR/$P1_BOOTSUB"
+	else
+		P1_BOOT_DIR=$P1_PART_DIR
+	fi
+	P1_LOG="$P1_BOOT_DIR/phase1-boot.log"
+	P1_MARKER="$P1_BOOT_DIR/try-phase1"
+}
+set_boot_paths "$DEF_BOOTSUB"
+# 唯一允许的 overlay 参数串（逐字，别"优化"）
+P1_OVL_OPTS='lowerdir=/lower,upperdir=/overlay/upper,workdir=/overlay/work'
+
+LOG_READY=''
+WDT_PID=''
+
+say()  { /bin/busybox echo "phase1-init: $*"; }
+warn() { /bin/busybox echo "phase1-init: warn: $*"; logline "phase1-init: warn: $*"; }
+
+# 追加一行到持久日志；没挂上 p1 时静默跳过（日志不可用不能变成新的失败点）
+logline() {
+	[ -n "$LOG_READY" ] || return 0
+	[ -n "$P1_LOG" ] || return 0
+	/bin/busybox echo "$*" >> "$P1_LOG" 2>/dev/null || LOG_READY=''
+	return 0
+}
+
+# 确认日志是否可写：标记与日志只有一个真实位置（${P1_BOOT_DIR}，见 F-1），不存在"另一个视角"。
+# 看门狗是子 shell（看不到父进程之后设的 LOG_READY），所以它也走这里。
+reacquire_log() {
+	[ -n "$LOG_READY" ] && return 0
+	if [ -f "$P1_LOG" ]; then
+		LOG_READY=1
+		return 0
+	fi
+	return 1
+}
+
+# 删试跑标记 —— die / 看门狗 / 成功切根三条路径**共用这一个实现**（不许各写一份）。
+# 语义漂移的代价就是重启循环（设备无键盘），所以判定只看"文件有没有真的消失"：
+#   1) 先删主路径 $P1_MARKER = <p1>/<phase1_bootsub>/try-phase1（= GRUB 查的 p1:/boot/try-phase1）
+#   2) 主路径不存在或删不掉 ⇒ 走 rescue_drop_marker 兜底（不依赖路径推断正确）
+#   3) 两处都没删到 ⇒ 终态 REMOVE-FAILED（人工介入）
+# 四种结果各有一个稳定判读串：
+#   `recovery: removed <主路径>` / `recovery: rescued: removed <兜底路径>` /
+#   `recovery: no marker at ...`（本来没在试跑）/ `recovery: REMOVE-FAILED ...`（危险）
+drop_trial_marker() {
+	if [ -e "$P1_MARKER" ]; then
+		/bin/busybox rm -f "$P1_MARKER" 2>/dev/null
+		if [ ! -e "$P1_MARKER" ]; then
+			/bin/busybox echo "phase1-init: recovery: removed ${P1_MARKER}" >&2
+			logline "phase1-init: recovery: removed ${P1_MARKER}（本次试跑已被消耗，下次启动回 GRUB 默认槽）"
+			return 0
+		fi
+		logline "phase1-init: recovery: main-remove-failed ${P1_MARKER}（改试兜底位置）"
+	fi
+	rescue_drop_marker
+	_rr=$?
+	[ "$_rr" = 0 ] && return 0
+	[ "$_rr" = 1 ] && {
+		logline "phase1-init: recovery: no marker at ${P1_MARKER} 及兜底位置（本来就是 live 默认项）"
+		return 0
+	}
+	logline "phase1-init: recovery: REMOVE-FAILED ${P1_MARKER}（主路径与兜底位置都没删到，可能重启循环，需人工在 p1 上删除）"
+	return 1
+}
+
+# 兜底：**删标记这件事不依赖路径推断正确**。
+# 只要主路径（${P1_MARKER}）没删到东西，就按 p1 上两个已知位置再试一次 ——
+# 这同时覆盖两种错位：① p1 上没有 phase1_bootsub 那个子目录；② 那个子目录存在但不是引导目录
+# （例如误传 phase1_bootsub=efi），此时 $P1_BOOT_DIR 存在但标记在 boot/ 里。
+# 返回 0 = 兜底删到了；1 = 兜底位置本来就没有标记；2 = 有标记但删不掉（终态失败）。
+rescue_drop_marker() {
+	_rescued=0
+	_stuck=0
+	for _mk in "$P1_PART_DIR/boot/try-phase1" "$P1_PART_DIR/try-phase1"; do
+		[ -e "$_mk" ] || continue
+		/bin/busybox rm -f "$_mk" 2>/dev/null
+		if [ -e "$_mk" ]; then
+			/bin/busybox echo "phase1-init: recovery: RESCUE-REMOVE-FAILED ${_mk}" >&2
+			logline "phase1-init: recovery: RESCUE-REMOVE-FAILED ${_mk}"
+			_stuck=1
+			continue
+		fi
+		_rescued=1
+		/bin/busybox echo "phase1-init: recovery: rescued: removed ${_mk}" >&2
+		logline "phase1-init: recovery: rescued: removed ${_mk}（主路径 ${P1_MARKER} 没删到，按已知位置兜底）"
+	done
+	[ "$_rescued" = 1 ] && return 0
+	[ "$_stuck" = 1 ] && return 2
+	return 1
+}
+
+ok_stage() { # <阶段> <细节>
+	_m="phase1-init: ok stage=$1: $2"
+	/bin/busybox echo "$_m"
+	logline "$_m"
+}
+
+# 补挂 p1：die 用来自救（模块加载阶段就失败时 p1 还没挂）；已挂上则直接返回
+ensure_bootlog() {
+	# ① p1 已经挂在 $P1_PART_DIR 上（父进程挂过 / 或本子 shell 之前挂过）⇒ 日志立刻可写；
+	#    不要求日志文件已存在（首次试跑时还没有这个文件，logline 会创建它）。
+	#    审计 H2：以前只看 [ -f "$P1_LOG" ]，第一次试跑时子 shell 认不出日志，还会去重挂一个已挂的 p1。
+	if /bin/busybox grep -q " ${P1_PART_DIR} " /proc/mounts 2>/dev/null; then
+		if [ -d "$P1_BOOT_DIR" ]; then
+			LOG_READY=1
+			return 0
+		fi
+	fi
+	[ -n "$LOG_READY" ] && return 0
+	reacquire_log && return 0
+	[ -n "$PHASE1_BOOT" ] || PHASE1_BOOT=$DEF_BOOT
+	[ -n "$PHASE1_BOOT" ] || return 1
+	[ -b "$PHASE1_BOOT" ] || mkblkdev 600 "$PHASE1_BOOT" "${PHASE1_BOOT##*/}" >/dev/null 2>&1
+	[ -b "$PHASE1_BOOT" ] || return 1
+	/sbin/modprobe vfat 2>/dev/null
+	/sbin/modprobe nls_cp437 2>/dev/null
+	/sbin/modprobe nls_iso8859-1 2>/dev/null
+	/bin/busybox mkdir -p "$P1_PART_DIR" 2>/dev/null
+	/bin/busybox mount -t vfat -o rw,noatime "$PHASE1_BOOT" "$P1_PART_DIR" 2>/dev/null || return 1
+	[ -d "$P1_BOOT_DIR" ] || return 1
+	LOG_READY=1
+	logline "phase1-init: recovery: p1 由 die 补挂成功（${PHASE1_BOOT} -> ${P1_PART_DIR}，日志 ${P1_LOG}）"
+	return 0
+}
+
+# 失败唯一出口：写日志 -> 删试跑标记 -> sync; sleep 5; reboot -f
+die() {
+	_stage=$1
+	shift
+	_m="phase1-init: FAIL stage=$_stage: $*"
+	/bin/busybox echo "$_m" >&2
+	ensure_bootlog >/dev/null 2>&1
+	logline "$_m"
+	stop_watchdog
+	# 删标记**无条件**：LOG_READY 只决定日志写不写得进去，不决定"标记删不删"。
+	# drop_trial_marker 自带 [ -e ] 守卫与兜底，所以"p1 已挂但日志写不出去"时照样能删
+	# （审计 H1：以前这里被 LOG_READY 门控，而 logline 写失败会清 LOG_READY ⇒ 明明能删却不删）。
+	drop_trial_marker
+	_mk_rc=$?
+	if [ -z "$LOG_READY" ]; then
+		/bin/busybox echo "phase1-init: recovery: 日志不可用；删标记结果 rc=${_mk_rc}（详见上一行 console 输出）" >&2
+	fi
+	/bin/busybox sync
+	/bin/busybox sleep 5
+	/bin/busybox reboot -f
+	# reboot -f 返回说明这条路也断了：落一行日志（无屏幕时 console 等于丢了）后交给 panic=10。
+	# **不落交互 shell**（设备无键盘，读 tty1 会永久挂死）。
+	/bin/busybox echo "phase1-init: FAIL stage=$_stage: reboot -f 也失败，等 panic=10" >&2
+	logline "phase1-init: FAIL stage=${_stage}: reboot -f 也失败，等 panic=10（只能等内核 panic 重启）"
+	while :; do /bin/busybox sleep 3600; done
+}
+
+# 总超时看门狗：initramfs 自己挂死时（等设备、modprobe 重试）panic=10 不会触发
+start_watchdog() {
+	(
+		/bin/busybox sleep "$P1_WDT_SECS"
+		# 卡死超时 = 一次失败：与 die 完全一致 —— 先自救补挂 p1（卡死往往就发生在 p1 挂载之前），
+		# 再删标记。少了这一步时，modprobe/建节点卡住 ⇒ 120s 后删不到标记 ⇒ 每 120s 一轮重启。
+		ensure_bootlog >/dev/null 2>&1
+		/bin/busybox echo "phase1-init: watchdog: fired after ${P1_WDT_SECS}s -> 补挂 p1 + 删标记 + reboot -f" >&2
+		logline "phase1-init: watchdog: fired after ${P1_WDT_SECS}s（卡住超时，按 die 语义回滚）"
+		drop_trial_marker
+		/bin/busybox sync
+		/bin/busybox reboot -f
+	) &
+	WDT_PID=$!
+	say "watchdog: armed ${P1_WDT_SECS}s (pid $WDT_PID)"
+}
+
+stop_watchdog() {
+	[ -n "$WDT_PID" ] || return 0
+	/bin/busybox kill "$WDT_PID" 2>/dev/null
+	WDT_PID=''
+	say "watchdog: disarmed（切根后再触发会把新系统重启掉）"
+	return 0
+}
+
+# cmdline 取值：cmdline_get <键> ；匹配 "键=值"，找不到返回 1
+cmdline_get() {
+	for _kv in $(/bin/busybox cat /proc/cmdline 2>/dev/null); do
+		case $_kv in
+			"$1="*) /bin/busybox printf '%s' "${_kv#*=}"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# 字符设备节点（已存在就跳过）
+mknode() {
+	[ -e "$2" ] && return 0
+	/bin/busybox mknod -m "$1" "$2" c "$3" "$4"
+}
+
+# 本设备实测的回退设备号（sysfs 只读时才用；换机器/换几何请改这里）
+blk_fallback() {
+	case $1 in
+		nvme0n1)   /bin/busybox echo '259 0' ;;
+		nvme0n1p1) /bin/busybox echo '259 1' ;;
+		nvme0n1p3) /bin/busybox echo '259 3' ;;
+		*)         /bin/busybox echo '' ;;
+	esac
+}
+
+# mkblkdev <mode> <path> <sysfs-block-name>：优先 /sys/class/block/<name>/dev，读不到才回退
+mkblkdev() {
+	[ -e "$2" ] && return 0
+	_maj=''
+	_min=''
+	if [ -r "/sys/class/block/$3/dev" ]; then
+		_maj=$(/bin/busybox cut -d: -f1 "/sys/class/block/$3/dev")
+		_min=$(/bin/busybox cut -d: -f2 "/sys/class/block/$3/dev")
+	fi
+	if [ -z "$_maj" ] || [ -z "$_min" ]; then
+		_fb=$(blk_fallback "$3")
+		_maj=$(/bin/busybox echo "$_fb" | /bin/busybox cut -d' ' -f1)
+		_min=$(/bin/busybox echo "$_fb" | /bin/busybox cut -d' ' -f2)
+	fi
+	if [ -z "$_maj" ] || [ -z "$_min" ]; then
+		warn "devnode: $2（$3）既无 sysfs 也无回退设备号"
+		return 1
+	fi
+	/bin/busybox mknod -m "$1" "$2" b "$_maj" "$_min" || return 1
+	say "devnode: $2 -> b $_maj:$_min"
+	return 0
+}
+
+# ===========================================================================
+say "start build=$PHASE1_BUILD (kernel $(/bin/busybox uname -r))"
+/bin/busybox mkdir -p /proc /sys /dev /tmp "$P1_PART_DIR" "$P1_LOWER_DIR" "$P1_OVL_DIR" "$P1_NEWROOT" \
+	|| die mkdir "mkdir -p /proc /sys /dev /tmp /p1 /lower /overlay /newroot"
+
+# ---- 1) proc / sysfs（kmodloader 要读 /proc/modules，proc 必须最先挂）-----
+/bin/busybox mount -t proc  proc  /proc || die proc "mount -t proc proc /proc"
+ok_stage proc "mounted -t proc"
+/bin/busybox mount -t sysfs sysfs /sys  || die sys "mount -t sysfs sysfs /sys"
+ok_stage sys "mounted -t sysfs（读 /sys/class/block/*/dev 用）"
+
+# ---- 2) 参数：默认值来自占位符，cmdline 覆盖 ------------------------------
+PHASE1_DEV=$(cmdline_get phase1_dev) || PHASE1_DEV=$DEF_DEV
+[ -n "$PHASE1_DEV" ] || PHASE1_DEV=$DEF_DEV
+PHASE1_BOOT=$(cmdline_get phase1_boot) || PHASE1_BOOT=$DEF_BOOT
+[ -n "$PHASE1_BOOT" ] || PHASE1_BOOT=$DEF_BOOT
+# 注意：找到但值为空（phase1_bootsub=）是合法几何（引导文件直放 p1 根），不能拿默认值盖掉
+PHASE1_BOOTSUB=$(cmdline_get phase1_bootsub) || PHASE1_BOOTSUB=$DEF_BOOTSUB
+set_boot_paths "$PHASE1_BOOTSUB"
+PHASE1_LOWER_SUBVOL=$(cmdline_get phase1_lower) || PHASE1_LOWER_SUBVOL=$DEF_LOWER
+[ -n "$PHASE1_LOWER_SUBVOL" ] || PHASE1_LOWER_SUBVOL=$DEF_LOWER
+PHASE1_OVL_SUBVOL=$(cmdline_get phase1_overlay) || PHASE1_OVL_SUBVOL=$DEF_OVL
+[ -n "$PHASE1_OVL_SUBVOL" ] || PHASE1_OVL_SUBVOL=$DEF_OVL
+PHASE1_DOCKER_SUBVOL=$(cmdline_get phase1_docker) || PHASE1_DOCKER_SUBVOL=$DEF_DOCKER
+[ -n "$PHASE1_DOCKER_SUBVOL" ] || PHASE1_DOCKER_SUBVOL=$DEF_DOCKER
+PHASE1_SWAP_SUBVOL=$(cmdline_get phase1_swap) || PHASE1_SWAP_SUBVOL=$DEF_SWAP
+[ -n "$PHASE1_SWAP_SUBVOL" ] || PHASE1_SWAP_SUBVOL=$DEF_SWAP
+say "params: dev=$PHASE1_DEV boot=$PHASE1_BOOT bootsub=${P1_BOOTSUB:-<p1 根>}"
+say "params: 标记=$P1_MARKER 日志=$P1_LOG"
+say "params: lower=$PHASE1_LOWER_SUBVOL overlay=$PHASE1_OVL_SUBVOL"
+say "params: docker=$PHASE1_DOCKER_SUBVOL swap=$PHASE1_SWAP_SUBVOL"
+say "cmdline: $(/bin/busybox cat /proc/cmdline 2>/dev/null)"
+
+# ---- 3) /dev：CONFIG_DEVTMPFS=n，必须自己造 -------------------------------
+if /bin/busybox grep -q 'devtmpfs' /proc/filesystems 2>/dev/null \
+   && /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null; then
+	say "dev: 内核提供 devtmpfs，已挂载"
+else
+	/bin/busybox mount -t tmpfs tmpfs /dev || die dev "mount -t tmpfs tmpfs /dev"
+	say "dev: 无 devtmpfs（CONFIG_DEVTMPFS=n）-> tmpfs + mknod"
+fi
+ok_stage dev "/dev 已就绪"
+
+mknode 600 /dev/console 5 1 || die console "mknod /dev/console c 5 1"
+mknode 666 /dev/null    1 3 || die console "mknod /dev/null c 1 3"
+mknode 666 /dev/tty     5 0 || die console "mknod /dev/tty c 5 0"
+
+# 内核在没有 /dev/console 时给 init 一个坏 fd，必须重定向回来才上屏
+if [ -c /dev/console ]; then
+	exec </dev/console >/dev/console 2>&1
+else
+	say "WARN: /dev/console 缺失，输出只能靠内核 printk"
+fi
+
+DISK_NAME=${PHASE1_DEV%p[0-9]*}
+[ -n "$DISK_NAME" ] || DISK_NAME=$PHASE1_DEV
+mkblkdev 600 "/dev/${DISK_NAME##*/}" "${DISK_NAME##*/}"
+mkblkdev 600 "$PHASE1_DEV" "${PHASE1_DEV##*/}" || die devnode "$PHASE1_DEV 建不出块设备节点"
+mkblkdev 600 "$PHASE1_BOOT" "${PHASE1_BOOT##*/}" || die devnode "$PHASE1_BOOT 建不出块设备节点"
+[ -b "$PHASE1_DEV" ]  || die devnode "$PHASE1_DEV 不是块设备（查 /sys/class/block 与 /proc/partitions）"
+[ -b "$PHASE1_BOOT" ] || die devnode "$PHASE1_BOOT 不是块设备（p1 缺失？）"
+ok_stage devnode "$PHASE1_DEV + $PHASE1_BOOT 就绪"
+
+# 硬规则 1：cmdline **禁 rootwait** —— 找不到根会无限等待，panic=10 也不触发（只能拔电）。
+# 放在这里而不是更早：此刻 /dev/console 已接管、块设备节点已就绪 ⇒ 失败能落日志、能删标记。
+case " $(/bin/busybox cat /proc/cmdline 2>/dev/null) " in
+	*" rootwait "*)
+		die cmdline "cmdline 出现 rootwait（本设计禁用：找不到根会无限等待，panic=10 也不触发）" ;;
+esac
+
+# ---- 4) 看门狗：模块加载之前就上，覆盖"卡死"这个 panic=10 兜不住的情况 -----
+start_watchdog
+
+# ---- 5) 模块：只用 /sbin/modprobe（kmodloader 软链，argv[0] 分派） ---------
+say "modprobe: btrfs"
+/sbin/modprobe btrfs
+_rc=$?
+[ "$_rc" -eq 0 ] || warn "modprobe btrfs 返回 rc=${_rc}（不看 rc，下面按 /proc/modules 硬断言）"
+if ! /bin/busybox grep -q '^btrfs ' /proc/modules 2>/dev/null; then
+	/bin/busybox cut -d' ' -f1 /proc/modules 2>/dev/null | while read -r _m; do say "module: $_m"; done
+	die modprobe "btrfs 不在 /proc/modules（modprobe rc=${_rc}）—— 查 /lib/modules 里的 10 个 ko"
+fi
+ok_stage modprobe "btrfs 已在 /proc/modules"
+
+# p1 是 vfat：没有 vfat/fat/nls_* 就写不出持久日志（v4/v5 的"零痕迹"就是这么来的）
+/sbin/modprobe vfat 2>/dev/null
+/sbin/modprobe nls_cp437 2>/dev/null
+/sbin/modprobe nls_iso8859-1 2>/dev/null
+/sbin/modprobe nls_utf8 2>/dev/null
+/bin/busybox grep -q 'vfat' /proc/filesystems 2>/dev/null \
+	|| warn "vfat 不在 /proc/filesystems —— 持久日志可能写不出来"
+
+# ---- 6) 挂 p1 写持久日志（无屏幕/键盘时唯一的判读手段） -------------------
+# F-1：p1 根下有自己的 boot/ 目录，live 的 /boot = p1:/boot。所以挂 **p1 根** 到 /p1，
+# 标记与日志放 /p1/<phase1_bootsub>/，与 GRUB 查的 p1:/boot/try-phase1 是同一个文件。
+/bin/busybox mkdir -p "$P1_PART_DIR"
+if /bin/busybox mount -t vfat -o rw,noatime "$PHASE1_BOOT" "$P1_PART_DIR" 2>/dev/null; then
+	if [ ! -d "$P1_BOOT_DIR" ]; then
+		# 几何不一致 ⇒ 标记在别处；die -> drop_trial_marker 会自动走 rescue 兜底，不会变成重启循环
+		die bootlog "p1（${PHASE1_BOOT}）上没有 ${P1_BOOTSUB}/ 目录；phase1_bootsub=${P1_BOOTSUB:-<空=p1 根>} ⇒ 标记与日志无处可写（GRUB 查的也是这个路径）"
+	fi
+	LOG_READY=1
+	logline "=== phase1-init: start build=$PHASE1_BUILD uptime=$(/bin/busybox cat /proc/uptime 2>/dev/null) ==="
+	logline "phase1-init: info cmdline=$(/bin/busybox cat /proc/cmdline 2>/dev/null)"
+	logline "phase1-init: info params dev=$PHASE1_DEV boot=$PHASE1_BOOT bootsub=${P1_BOOTSUB:-<p1 根>}"
+	logline "phase1-init: info paths marker=$P1_MARKER log=$P1_LOG"
+	logline "phase1-init: info params lower=$PHASE1_LOWER_SUBVOL overlay=$PHASE1_OVL_SUBVOL"
+	logline "phase1-init: info marker $( [ -e "$P1_MARKER" ] && /bin/busybox echo present || /bin/busybox echo absent )"
+	ok_stage bootlog "mounted $PHASE1_BOOT -> $P1_BOOT_DIR, log=$P1_LOG"
+else
+	# 日志写不出来 = 后面所有判读都瞎；但仍不能落交互 shell
+	die bootlog "mount -t vfat $PHASE1_BOOT $P1_PART_DIR 失败（vfat/nls 模块或 p1 文件系统？）"
+fi
+
+# ---- 7) 先挂 @overlay（rw，带 compress=zstd:1）—— **顺序不能反** -----------
+# 【坑 · 真机实测】btrfs 的挂载参数是 **superblock 级**：只有**第一次**挂载该文件系统时带上的
+# 才生效，之后的 `compress=` 被**静默忽略**（rc=0、无 dmesg、/proc/mounts 里也不出现）。
+# 所以本文件里 @overlay 必须先于 @root 挂：第一次挂载就把 compress=zstd:1 定下来，
+# 随后挂的 /lower、@docker、@swap 全部继承这个 sb 级设置。**不要把这两块换回原来的顺序**，
+# 否则整块盘不带压缩（写层与 docker 层的体积/写放大都会退化；真机实测 100MiB 零数据：
+# compress=no +105,054,208 B vs zstd:1 +3,571,712 B，≈29:1）。
+# 顺带记一条：关压缩要写 compress=no，写 nocompress 会被 btrfs 拒绝。
+say "overlay: mount -t btrfs -o subvol=$PHASE1_OVL_SUBVOL,noatime,compress=zstd:1 $PHASE1_DEV $P1_OVL_DIR"
+/bin/busybox mount -t btrfs -o "subvol=$PHASE1_OVL_SUBVOL,noatime,compress=zstd:1" "$PHASE1_DEV" "$P1_OVL_DIR"
+_rc=$?
+[ "$_rc" -eq 0 ] || die overlay-mount "mount $PHASE1_OVL_SUBVOL -> $P1_OVL_DIR 失败 (rc=$_rc)"
+/bin/busybox mkdir -p "$P1_OVL_DIR/upper" "$P1_OVL_DIR/work" \
+	|| die overlay-dirs "mkdir -p $P1_OVL_DIR/upper $P1_OVL_DIR/work 失败"
+ok_stage overlay-mount "$PHASE1_OVL_SUBVOL -> ${P1_OVL_DIR}（upper/work 就绪）"
+
+# 读回验证：sb 级参数到底生效没有，只能看 /proc/mounts（这次就是"代码里有、实际不生效"漏掉的）
+_ovl_opts=''
+while read -r _md _mp _mft _mopts _mrest; do
+	[ "$_mp" = "$P1_OVL_DIR" ] && _ovl_opts=$_mopts
+done < /proc/mounts
+case $_ovl_opts in
+	*compress=zstd:1*) ok_stage compress "$P1_OVL_DIR 挂载行含 compress=zstd:1" ;;
+	*) die compress "$P1_OVL_DIR 的 /proc/mounts 行没有 compress=zstd:1（实际: ${_ovl_opts:-<读不到>}）—— btrfs 挂载参数是 sb 级，首次挂载决定，别把 @overlay/@root 的挂载顺序改回去" ;;
+esac
+
+# ---- 8) 再挂 @root 以 ro 挂 /lower（overlay lower 只读基座）-------------
+# 顺序说明见上一步：@overlay 已经把这把文件系统的 sb 级参数定下来，这里的 ro 挂载只是同一 sb 的
+# 另一个子卷视图，不会再改变 compress 设置。
+say "lower: mount -t btrfs -o subvol=$PHASE1_LOWER_SUBVOL,ro,noatime $PHASE1_DEV $P1_LOWER_DIR"
+/bin/busybox mount -t btrfs -o "subvol=$PHASE1_LOWER_SUBVOL,ro,noatime" "$PHASE1_DEV" "$P1_LOWER_DIR"
+_rc=$?
+[ "$_rc" -eq 0 ] || die lower-mount "mount $PHASE1_LOWER_SUBVOL ro -> $P1_LOWER_DIR 失败 (rc=$_rc)"
+ok_stage lower-mount "$PHASE1_LOWER_SUBVOL ro -> $P1_LOWER_DIR"
+
+[ -f "$P1_LOWER_DIR/etc/openwrt_release" ] \
+	|| die lower-release "$P1_LOWER_DIR/etc/openwrt_release 不存在（子卷选错？空子卷？）"
+ok_stage lower-release "openwrt_release 存在（真的是 OpenWrt 基座）"
+
+# ro 断言：能写就说明 ro 没生效 —— 那是 overlay 语义的地基，必须失败
+if /bin/busybox touch "$P1_LOWER_DIR/.p1-ro-probe" 2>/dev/null; then
+	/bin/busybox rm -f "$P1_LOWER_DIR/.p1-ro-probe" 2>/dev/null
+	die lower-readonly "$P1_LOWER_DIR 竟然可写，ro 没生效（overlay lower 必须只读）"
+fi
+ok_stage lower-readonly "touch $P1_LOWER_DIR 失败（符合预期：ro）"
+
+# ---- 9) overlay 合成 /newroot（参数串逐字固定） --------------------------
+say "overlay: mount -t overlay -o $P1_OVL_OPTS overlay $P1_NEWROOT"
+/bin/busybox mount -t overlay -o "$P1_OVL_OPTS" overlay "$P1_NEWROOT"
+_rc=$?
+[ "$_rc" -eq 0 ] || die overlay-root "mount -t overlay -o $P1_OVL_OPTS -> $P1_NEWROOT 失败 (rc=$_rc)"
+[ -f "$P1_NEWROOT/etc/openwrt_release" ] \
+	|| die overlay-root "overlay 合成后 $P1_NEWROOT/etc/openwrt_release 不可见"
+ok_stage overlay-root "overlay 合成于 ${P1_NEWROOT}（${P1_OVL_OPTS}）"
+
+# ---- 10) 写入探针：必须真的落进 upper（否则可能是 tmpfs/ramoverlay 假阳性）----
+/bin/busybox touch "$P1_NEWROOT/.p1-probe" || die probe "touch $P1_NEWROOT/.p1-probe 失败（合成根不可写）"
+[ -f "$P1_OVL_DIR/upper/.p1-probe" ] \
+	|| die probe-upper "写入没落到 $P1_OVL_DIR/upper（upper 没生效，写进别的层了）"
+/bin/busybox rm -f "$P1_NEWROOT/.p1-probe"
+ok_stage probe "写入落 $P1_OVL_DIR/upper/.p1-probe（upper 生效）"
+
+# ---- 11) 把 /lower、/overlay 搬进新根 -----------------------------------
+# 注：`mount -o move` 保留该挂载的全部选项 ⇒ 新系统里的 /overlay 直接继承
+# `compress=zstd:1`（上游由 fstab 决定，我们没有 fstab）。退化路径"二次挂载"也带同样的选项。
+# switch_root 是 chroot+删旧根，不搬挂载 ⇒ 运行期 /rom、/overlay 不可达，且删旧根会撞挂载点。
+# 先试 mount -o move（无泄漏挂载），失败退化"同子卷二次挂载"。
+relocate() { # <阶段名> <当前挂载点> <目标> <子卷> <ro|rw>   （只服务 btrfs 子卷）
+	_rstage=$1
+	_src=$2
+	_dst=$3
+	_sv=$4
+	_ro=$5
+	# rw 子卷带 compress=zstd:1（与 fstab 对齐，见 M4）；ro 的 /lower 不需要
+	_opts="subvol=$_sv,noatime,compress=zstd:1"
+	[ "$_ro" = ro ] && _opts="subvol=$_sv,ro,noatime"
+	/bin/busybox mkdir -p "$_dst" || die "$_rstage" "mkdir -p $_dst 失败"
+	if /bin/busybox mount -o move "$_src" "$_dst" 2>/dev/null; then
+		ok_stage "$_rstage" "mount -o move $_src -> $_dst"
+		return 0
+	fi
+	warn "$_rstage: mount -o move $_src -> $_dst 失败，退化为同子卷二次挂载"
+	/bin/busybox mount -t btrfs -o "$_opts" "$PHASE1_DEV" "$_dst" \
+		|| die "$_rstage" "二次挂载 -o $_opts 到 $_dst 也失败"
+	# 旧根里的那次挂载要摘掉，否则 switch_root 删旧根时撞 EBUSY
+	/bin/busybox umount "$_src" 2>/dev/null || /bin/busybox umount -l "$_src" 2>/dev/null
+	ok_stage "$_rstage" "二次挂载 $_sv -> ${_dst}（已摘 ${_src}）"
+	return 0
+}
+
+# 把 p1 的引导目录挂进新根。注意 `mount -o move` 只能搬**挂载点**，搬不了子目录 ⇒ 这里用 bind。
+relocate_boot() {
+	/bin/busybox mkdir -p "$P1_NEWROOT/boot" || die boot-relocate "mkdir -p $P1_NEWROOT/boot 失败"
+	if /bin/busybox mount -o bind "$P1_BOOT_DIR" "$P1_NEWROOT/boot" 2>/dev/null; then
+		[ -f "$P1_NEWROOT/boot/phase1-boot.log" ] \
+			|| die boot-relocate "$P1_NEWROOT/boot/phase1-boot.log 不可见（bind $P1_BOOT_DIR 没生效？）"
+		ok_stage boot-relocate "mount -o bind $P1_BOOT_DIR -> $P1_NEWROOT/boot（= live 的 /boot）"
+		return 0
+	fi
+	warn "boot-relocate: mount -o bind $P1_BOOT_DIR -> $P1_NEWROOT/boot 失败，退化为再挂一次 p1"
+	/bin/busybox mount -t vfat -o rw,noatime "$PHASE1_BOOT" "$P1_NEWROOT/boot" \
+		|| die boot-relocate "bind 与二次挂载都失败（$PHASE1_BOOT -> $P1_NEWROOT/boot）"
+	# 退化视图 = p1 根；只有引导目录就在 p1 根时视图才与 live 一致
+	if [ -f "$P1_NEWROOT/boot/phase1-boot.log" ]; then
+		ok_stage boot-relocate "再挂一次 p1 -> $P1_NEWROOT/boot"
+	elif [ -n "$P1_BOOTSUB" ] && [ -f "$P1_NEWROOT/boot/$P1_BOOTSUB/phase1-boot.log" ]; then
+		warn "boot-relocate: 退化视图 = p1 根（live 的 /boot 会看到 ${P1_BOOTSUB}/ 子目录）"
+		ok_stage boot-relocate "再挂一次 p1 -> $P1_NEWROOT/boot（视图=p1 根）"
+	else
+		die boot-relocate "$P1_NEWROOT/boot 里找不到 phase1-boot.log（bind 与二次挂载都没生效）"
+	fi
+	return 0
+}
+
+relocate rom-relocate "$P1_LOWER_DIR" "$P1_NEWROOT/rom" "$PHASE1_LOWER_SUBVOL" ro
+[ -d "$P1_NEWROOT/rom/etc" ] \
+	|| die rom-relocate "$P1_NEWROOT/rom/etc 不存在（/rom 视图没建起来）"
+relocate overlay-relocate "$P1_OVL_DIR" "$P1_NEWROOT/overlay" "$PHASE1_OVL_SUBVOL" rw
+[ -d "$P1_NEWROOT/overlay/upper" ] \
+	|| die overlay-relocate "$P1_NEWROOT/overlay/upper 不存在（/overlay 视图没建起来）"
+ok_stage relocate "$P1_NEWROOT/rom + $P1_NEWROOT/overlay 就绪（运行期视图与上游 extroot 一致）"
+
+# 搬运之后 overlay 是否仍可写（N.9 未确认项）：写一次，必须仍落进新根下的 upper
+/bin/busybox touch "$P1_NEWROOT/.p1-probe2" || die post-move-probe "搬运后 $P1_NEWROOT 不可写"
+if [ ! -f "$P1_NEWROOT/overlay/upper/.p1-probe2" ]; then
+	die post-move-probe "搬运后写入没落到 $P1_NEWROOT/overlay/upper（overlay 被搬运弄坏）"
+fi
+/bin/busybox rm -f "$P1_NEWROOT/.p1-probe2"
+ok_stage post-move-probe "搬运后写入仍落 $P1_NEWROOT/overlay/upper"
+
+# ---- 12) @docker / @swap（存在才挂，失败只告警）-------------------------
+mount_optional() { # <子卷> <目标> <标签>
+	/bin/busybox mkdir -p "$2" 2>/dev/null || { warn "optional: mkdir $2 失败，跳过 $3"; return 0; }
+	# 同上：rw 子卷带 compress=zstd:1（@docker 尤其需要 —— 镜像层是写放大重灾区）
+	if /bin/busybox mount -t btrfs -o "subvol=$1,noatime,compress=zstd:1" "$PHASE1_DEV" "$2" 2>/dev/null; then
+		ok_stage "subvol-$3" "$1 -> $2"
+	else
+		warn "optional: subvol=$1 不存在或挂载失败，跳过 $3（Phase 1 装机应已创建）"
+	fi
+	return 0
+}
+mount_optional "$PHASE1_DOCKER_SUBVOL" "$P1_NEWROOT/opt/docker" docker
+mount_optional "$PHASE1_SWAP_SUBVOL"   "$P1_NEWROOT/swap"       swap
+
+# ---- 13) 新根可用性 ----------------------------------------------------
+[ -x "$P1_NEWROOT/sbin/init" ] \
+	|| die newroot-init "$P1_NEWROOT/sbin/init 不存在或不可执行（子卷选错？）"
+ok_stage newroot-init "$P1_NEWROOT/sbin/init 可执行"
+
+# ---- 14) 收尾：先删标记（成功即一次性）-> 把 p1 的引导目录挂进新根 -> 撤看门狗 -> 切根 ----
+# 删标记 = "本次试跑已被消耗"，与"失败"同义：成功、失败、看门狗超时三条路径都只消耗一次机会，
+# 所以任何一条都不会形成重启循环。删在"搬挂载"之前 —— 此时 p1 还稳挂在 $P1_PART_DIR 上，
+# 路径唯一（不再有"搬进新根后的另一个视角"，F-1）。
+logline "phase1-init: info 切根前删除试跑标记（成功即一次性）"
+drop_trial_marker
+
+# live 系统的 /boot 是 79_move_config 先挂 p1 根再 `mount --bind /boot/boot /boot`；
+# 我们跳过 fstools 的 do_mount_root，没人再挂它 ⇒ 必须自己把 p1 的引导目录挂进新根，
+# 否则新系统起来后 /boot 不存在（docs/ops.md、Phase 3 的 grubenv、事后读日志全要手工补挂）。
+# 也不能简单 umount：那样切根后再失败就没地方写日志、更删不了标记。
+relocate_boot
+
+/bin/busybox echo "initramfs: switching root upperdir=/overlay/upper"
+logline "initramfs: switching root upperdir=/overlay/upper"
+logline "phase1-init: info /proc/mounts（切根前的现场）："
+/bin/busybox cat /proc/mounts 2>/dev/null | while read -r _l; do logline "phase1-init: mounts: ${_l}"; done
+/bin/busybox sync
+# p1 根在旧根里的那次挂载摘掉（bind 出去的 /newroot/boot 共用同一 superblock，不受影响），
+# 免得 switch_root 删旧根时撞挂载点。
+/bin/busybox umount "$P1_PART_DIR" 2>/dev/null || /bin/busybox umount -l "$P1_PART_DIR" 2>/dev/null
+LOG_READY=''
+stop_watchdog
+say "switch-root: exec switch_root $P1_NEWROOT /sbin/init"
+exec /bin/busybox switch_root "$P1_NEWROOT" /sbin/init
+
+# exec 返回 = 切根失败。 不落交互 shell（无键盘），走 die 回滚。
+die switch-root "exec switch_root $P1_NEWROOT /sbin/init 意外返回"
