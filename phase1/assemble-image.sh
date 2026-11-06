@@ -6,10 +6,15 @@
 #   p128  EF02    4M    GRUB core.img 预留（Phase 1 只按 4M 建，本轮不重建 core.img）
 #   p2    btrfs   至盘尾 @root(只读基座) / @overlay(upper+work) / @docker(→/opt/docker) / @swap(→/swap)
 #
-# 本轮（Phase 1）只有两个模式对机器无害、可以随便跑：
+# 三个模式对机器无害、可以随便跑：
 #   --dry-run        只打印完整计划（分区表 / 子卷 / 解包目标 / manifest / grub / cmdline），
 #                    不写盘、不 mkfs、不碰 /dev，退出码 0。
 #   --grub-dir DIR   只把 grub.cfg 渲染到 DIR/grub.cfg（真机试跑用），其它什么都不动。
+#   --image OUT.img --size 8G
+#                    镜像文件模式（CI 用）：truncate 出一个普通文件 → losetup -P →
+#                    分区/格式化/子卷/解包/manifest/grub-install → detach。**只写 OUT.img**，
+#                    绝不碰 /dev 下的任何整盘设备，也不需要人工 yes（目标是一个新文件）。
+#                    OUT.img 是未压缩镜像；gzip 与 sha256 由 phase1/build.sh 负责。
 #
 # 真装机路径（两个开关都不给时）写在文件末尾：分层校验（p1 元数据 → 文件系统 UUID →
 # 子卷枚举比对，全部打印）→ 手工输入 yes → destructive_install()。
@@ -38,6 +43,11 @@ ROOTFS=''
 KERNEL=''
 INITRD=''
 DISK=''
+# 镜像文件模式（--image OUT.img --size 8G）：写新文件，不碰 /dev 下的整盘
+IMAGE=''
+IMAGE_SIZE=''
+IMAGE_FORCE=0
+IMAGE_MIN_MB=2048
 BOOT_SIZE=256M
 ESP_SIZE=4M
 BOOT_SUBDIR=boot
@@ -63,7 +73,7 @@ CONSOLE='console=ttyS0,115200n8 console=tty1'
 BOOT_MNT=/mnt/phase1-boot
 DATA_MNT=/mnt/phase1-btrfs
 SUBVOLS='@root @overlay @docker @swap'
-GRUB_MODULES='part_msdos part_gpt fat normal linux search search_fs_uuid search_label test echo'
+GRUB_MODULES='part_msdos part_gpt fat normal linux search search_fs_uuid search_label test echo serial terminal'
 
 # ---------------------------------------------------------------------------
 # 输出与退出
@@ -87,11 +97,17 @@ usage_fail() { # <原因>
 
 usage() {
 	cat <<'EOF'
-phase1/assemble-image.sh —— Phase 1 装机骨架（本轮只 dry-run / 只渲染 grub.cfg）
+phase1/assemble-image.sh —— Phase 1 装机骨架（dry-run / 渲染 grub.cfg / 镜像文件模式 / 真装机）
 
 只读模式（对机器无害）：
   --dry-run                     只打印完整装机计划，不写盘、不 mkfs、不碰 /dev；退出码 0
   --grub-dir DIR                只把 grub.cfg 渲染到 DIR/grub.cfg（真机试跑用），不碰磁盘
+
+镜像文件模式（CI 用；只写 OUT.img，不碰 /dev 下的整盘）：
+  --image OUT.img               产出可 dd 的镜像文件（Linux + root；需要 losetup）
+  --size 8G                     镜像文件大小（与 --image 配套；下限 2G；要写成 8G 或 8192M）
+                                配 --dry-run 时只打印同一套计划、什么都不写
+  --force-overwrite             允许覆盖已存在的非空镜像文件（默认拒绝，防止手滑清掉宿主文件）
 
 真装机模式（需要全部参数；会先做分层校验并要求手工输入 yes）：
   --rootfs FILE|DIR             上游 rootfs（rootfs.tar.gz 或已解开的目录）
@@ -134,6 +150,11 @@ phase1/assemble-image.sh —— Phase 1 装机骨架（本轮只 dry-run / 只�
 不许用 root=PARTUUID= 锚定根，必须含 fstools_ignore_partname=1 与 panic=10，
 必须含 set fallback=0；--trial 时还必须有标记守卫与四个 phase1_* 键。
 校验不过直接退出非 0（不做任何"自动修补"）。
+
+镜像文件模式（--image）的边界：唯一被写的路径就是 OUT.img 本身（普通文件）。
+--image 与 --disk / --grub-dir / --trial 互斥；OUT.img 不许落在 /dev/ 下或是块设备。
+镜像里的根设备来自 initrd 烘焙的默认值（phase1/make-initramfs.sh --rootdev），
+因为最终镜像的 grub.cfg 不含 phase1_dev= 键（与 0 号项口径一致，ac-5 的校验也这么要求）。
 EOF
 }
 
@@ -158,6 +179,49 @@ boot_prefix() { # grub 视角的引导目录前缀：/boot；--boot-subdir '' �
 
 need_value() { # <选项名> <当前剩余参数个数>
 	[ "$2" -ge 2 ] || usage_fail "$1 需要一个参数"
+}
+
+# image_size_mb <SIZE> → 打印 MB 数（8G → 8192，8192M → 8192）；格式非法返回 1
+image_size_mb() {
+	case ${1:-} in
+	'' | *[!0-9GgMm]*) return 1 ;;
+	esac
+	case $1 in
+	*[Gg]) _n=${1%?} _f=1024 ;;
+	*[Mm]) _n=${1%?} _f=1 ;;
+	*) return 1 ;;
+	esac
+	case $_n in '' | *[!0-9]*) return 1 ;; esac
+	[ "$_n" -gt 0 ] || return 1
+	printf '%s\n' "$((_n * _f))"
+}
+
+# 镜像模式的参数校验：全部在写任何字节之前完成（fail-closed）
+image_validate() {
+	[ -n "$IMAGE" ] || usage_fail "--size 只能与 --image 一起用（--size 是镜像文件大小）"
+	[ -n "$IMAGE_SIZE" ] || usage_fail "--image 需要 --size（例如 --size 8G）"
+	[ -z "$DISK" ] || usage_fail "--image 与 --disk 互斥（前者写镜像文件，后者重建整盘）"
+	[ -z "$GRUB_DIR" ] || usage_fail "--image 与 --grub-dir 互斥（前者产出镜像，后者只渲染 grub.cfg）"
+	[ "$TRIAL" = 0 ] || usage_fail "--image 与 --trial 互斥（最终镜像只保留 0 号项）"
+	case $IMAGE in
+	/dev/*) usage_fail "--image 必须是普通文件路径，不能是设备: $IMAGE" ;;
+	esac
+	if [ -b "$IMAGE" ]; then
+		usage_fail "--image 必须是普通文件路径，不能是块设备: $IMAGE"
+	fi
+	if [ -d "$IMAGE" ]; then
+		usage_fail "--image 指向的是目录，请给它一个文件路径: $IMAGE"
+	fi
+	# 覆盖一个已有的普通文件是不可逆的（随后 truncate 到 --size）：默认拒绝，要 --force-overwrite
+	if [ -f "$IMAGE" ] && [ -s "$IMAGE" ] && [ "$IMAGE_FORCE" != 1 ]; then
+		usage_fail "--image 已存在且非空（$(wc -c <"$IMAGE" | tr -d ' ') 字节），拒绝覆盖: ${IMAGE}（确实要覆盖请加 --force-overwrite）"
+	fi
+	if ! _mb=$(image_size_mb "$IMAGE_SIZE"); then
+		usage_fail "--size 要写成 8G 或 8192M（收到: ${IMAGE_SIZE}）"
+	fi
+	if [ "$_mb" -lt "$IMAGE_MIN_MB" ]; then
+		usage_fail "--size 低于下限（镜像下限 2G，收到: ${IMAGE_SIZE}）"
+	fi
 }
 
 trial_cmdline() {
@@ -327,6 +391,17 @@ while [ $# -gt 0 ]; do
 		shift
 		DISK=$1
 		;;
+	--image)
+		need_value "$1" $#
+		shift
+		IMAGE=$1
+		;;
+	--size)
+		need_value "$1" $#
+		shift
+		IMAGE_SIZE=$1
+		;;
+	--force-overwrite) IMAGE_FORCE=1 ;;
 	--boot-size)
 		need_value "$1" $#
 		shift
@@ -935,13 +1010,13 @@ need_cmd() { # <命令> <安装提示>
 }
 
 check_tools() {
-	need_cmd sgdisk "opkg install gdisk（或改在 Linux 主机上跑本脚本）"
-	need_cmd mkfs.vfat "opkg install dosfstools"
-	need_cmd mkfs.btrfs "opkg install btrfs-progs"
-	need_cmd btrfs "opkg install btrfs-progs"
-	need_cmd blkid "opkg install blkid（busybox 版可能缺 -s/-o）"
-	need_cmd tar "装 tar 或用 busybox tar"
-	need_cmd grub-install "先在设备上装 grub2（本轮只用它写一次 core.img 与模块树）"
+	need_cmd sgdisk "Debian/Ubuntu: apt install gdisk；OpenWrt: opkg install gdisk"
+	need_cmd mkfs.vfat "Debian/Ubuntu: apt install dosfstools；OpenWrt: opkg install dosfstools"
+	need_cmd mkfs.btrfs "Debian/Ubuntu: apt install btrfs-progs；OpenWrt: opkg install btrfs-progs"
+	need_cmd btrfs "Debian/Ubuntu: apt install btrfs-progs；OpenWrt: opkg install btrfs-progs"
+	need_cmd blkid "Debian/Ubuntu: apt install util-linux；OpenWrt: busybox 版可能缺 -s/-o"
+	need_cmd tar "Debian/Ubuntu: apt install tar；OpenWrt: busybox tar"
+	need_cmd grub-install "Debian/Ubuntu: apt install grub-pc-bin grub-common；OpenWrt: opkg install grub2"
 	command -v partx >/dev/null 2>&1 || warn "没有 partx：新分区节点可能要手工 partx -a -n N:N 才出现"
 	command -v chattr >/dev/null 2>&1 || warn "没有 chattr：@docker/@swap 的 +C（nocow）会跳过"
 }
@@ -1092,9 +1167,11 @@ write_manifest() { # <@root 挂载点>
 	fi
 }
 
-install_grub() { # <内核文件> <initrd 文件>
+install_grub() { # <内核文件> <initrd 文件> [目标设备，默认 $DISK] [额外参数，镜像模式传 --no-floppy 且不 --recheck]
 	_kg=$1
 	_ig=$2
+	_target=${3:-$DISK}
+	_extra=${4:-}
 	_bootdir=$BOOT_MNT${BOOT_SUBDIR:+/$BOOT_SUBDIR}
 
 	mkdir -p "$_bootdir" || fail "无法创建 $_bootdir" "确认 p1 已挂到 $BOOT_MNT"
@@ -1105,12 +1182,19 @@ install_grub() { # <内核文件> <initrd 文件>
 
 	# Phase 1：这里就是唯一一次写 core.img（装到 p128 EF02）。后续只在模块集合变化时
 	# 才需要重建，那是 Phase 3 的事（见 decisions §0.1 的 p128 说明）。
-	say "  \$ grub-install --target=i386-pc --boot-directory=$_bootdir --modules=\"$GRUB_MODULES\" $DISK"
+	# 真装机：--recheck（重新探测设备映射，盘可能刚分区）。
+	# 镜像模式：--no-floppy 且不 --recheck（目标是一个 loop，--recheck 只会多探一遍宿主设备，
+	# 在 CI 上既慢又容易因为"找不到设备映射"误报）；这条差异由调用方用第 4 个参数传进来。
+	_recheck='--recheck'
+	case " $_extra " in
+	*' --no-recheck '*) _recheck='' ;;
+	esac
+	say "  \$ grub-install --target=i386-pc --boot-directory=$_bootdir --modules=\"$GRUB_MODULES\" $_extra ${_recheck:+$_recheck }$_target"
 	grub-install --target=i386-pc \
 		--boot-directory="$_bootdir" \
 		--modules="$GRUB_MODULES" \
-		--recheck "$DISK" ||
-		fail "grub-install 失败" "确认 p128 EF02 分区存在（sgdisk -p $DISK 的第 128 号）"
+		$_extra ${_recheck:+"$_recheck"} "$_target" ||
+		fail "grub-install 失败" "确认 p128 EF02 分区存在（sgdisk -p $_target 的第 128 号）"
 }
 
 # --- 唯一的破坏性入口：所有写盘动作都在这个函数里 ---
@@ -1188,8 +1272,280 @@ destructive_install() {
 }
 
 # ---------------------------------------------------------------------------
+# 镜像文件模式（--image OUT.img --size 8G）
+#
+# 边界（与真装机的唯一区别）：目标是一个普通文件 + 一个 loop 设备，**不碰 /dev 下的整盘**，
+# 因此不需要人工 yes；但仍然全部 fail-closed，且用 trap 保证"失败也把 loop 拆掉"。
+# ---------------------------------------------------------------------------
+IMAGE_LOOP=''
+IMAGE_P1=''
+IMAGE_P2=''
+IMAGE_P1_ON=0
+IMAGE_P2_ON=0
+
+image_teardown() { # [信号退出码]：失败/中断也必须把 loop 拆掉，绝不留半个 loop 设备
+	# 信号 trap 里 $? 是"上一条命令"的状态（通常是 0），直接用它会把 Ctrl-C / CI 取消
+	# 变成 exit 0 ⇒ build.sh 会接着把半截镜像压成 .img.gz 当成功产物。所以信号路径强制非 0。
+	_rc=$?
+	if [ "$#" -ge 1 ]; then
+		_rc=$1
+	fi
+	if [ "$_rc" = 0 ]; then
+		_rc=1
+	fi
+	trap - EXIT INT TERM HUP
+	if [ "$IMAGE_P1_ON" = 1 ]; then
+		umount "$BOOT_MNT" 2>/dev/null || warn "镜像 p1 卸载失败: ${BOOT_MNT}（detach loop 时内核会自行释放）"
+		IMAGE_P1_ON=0
+	fi
+	if [ "$IMAGE_P2_ON" = 1 ]; then
+		umount "$DATA_MNT" 2>/dev/null || warn "镜像 p2 卸载失败: ${DATA_MNT}（detach loop 时内核会自行释放）"
+		IMAGE_P2_ON=0
+	fi
+	if [ -n "$IMAGE_LOOP" ]; then
+		losetup -d "$IMAGE_LOOP" 2>/dev/null || warn "losetup -d $IMAGE_LOOP 失败（镜像文件仍可用，请手工 detach）"
+		IMAGE_LOOP=''
+	fi
+	exit "$_rc"
+}
+
+image_check_platform() {
+	if [ "$(uname -s 2>/dev/null)" != Linux ]; then
+		fail "镜像模式只在 Linux 上跑（当前 $(uname -s 2>/dev/null || echo unknown)：macOS 没有 losetup/mkfs.vfat/mkfs.btrfs）" "在 CI（ubuntu-22.04）或任意 Linux 主机上 sudo 跑；macOS 只跑 --dry-run 与静态用例（phase1/tests/assemble-image-mode.sh）"
+	fi
+	if [ "$(id -u 2>/dev/null)" != 0 ]; then
+		fail "镜像模式需要 root（losetup / mount / mkfs 都要特权）" "用 sudo sh $PROG --image ... --size ..."
+	fi
+}
+
+image_check_tools() {
+	# CI（ubuntu-22.04）一条命令装齐：apt-get install -y gdisk dosfstools btrfs-progs grub-pc-bin
+	#   grub-common util-linux coreutils e2fsprogs cpio
+	need_cmd truncate "Debian/Ubuntu: apt install coreutils"
+	need_cmd losetup "Debian/Ubuntu: apt install util-linux"
+	need_cmd sgdisk "Debian/Ubuntu: apt install gdisk"
+	need_cmd mkfs.vfat "Debian/Ubuntu: apt install dosfstools"
+	need_cmd mkfs.btrfs "Debian/Ubuntu: apt install btrfs-progs"
+	need_cmd btrfs "Debian/Ubuntu: apt install btrfs-progs"
+	need_cmd grub-install "Debian/Ubuntu: apt install grub-pc-bin grub-common（i386-pc 模块树在 grub-pc-bin）"
+	need_cmd mount "Debian/Ubuntu: apt install util-linux"
+	need_cmd umount "Debian/Ubuntu: apt install util-linux"
+	need_cmd tar "Debian/Ubuntu: apt install tar"
+	command -v partx >/dev/null 2>&1 || warn "没有 partx：分区节点可能不出现（util-linux 一般自带）"
+	command -v chattr >/dev/null 2>&1 || warn "没有 chattr：@docker/@swap 的 +C（nocow）会跳过"
+}
+
+require_image_inputs() {
+	[ -n "$ROOTFS" ] || usage_fail "镜像模式需要 --rootfs FILE|DIR（配 --image 时必填）"
+	[ -n "$KERNEL" ] || usage_fail "镜像模式需要 --kernel FILE（配 --image 时必填）"
+	[ -n "$INITRD" ] || usage_fail "镜像模式需要 --initrd FILE（配 --image 时必填）"
+	[ -e "$ROOTFS" ] || fail "rootfs 源不存在: $ROOTFS" "先准备 rootfs.tar.gz 或用 --dry-run --image 只看计划"
+	[ -e "$KERNEL" ] || fail "内核文件不存在: $KERNEL" "从 ImageBuilder 产物里取 boot/vmlinuz"
+	[ -e "$INITRD" ] || fail "initrd 不存在: $INITRD" "先跑 sh phase1/make-initramfs.sh 产出 initrd"
+}
+
+image_wait_part() { # <分区节点>：等内核把分区节点建出来（最多 ~10s）
+	_i=0
+	while [ "$_i" -lt 10 ]; do
+		if [ -b "$1" ]; then
+			return 0
+		fi
+		sleep 1
+		_i=$((_i + 1))
+	done
+	return 1
+}
+
+print_image_plan() {
+	[ -n "$ROOTFS" ] || usage_fail "--dry-run --image 需要 --rootfs FILE|DIR（计划里要写清基座来源）"
+	check_rootfs_baseline
+	if [ -n "$(rootfs_baseline_suspects "$ROOTFS" 2>/dev/null)" ]; then
+		_baseline='HEAD 时代内容（已 --allow-legacy-rootfs 放行）'
+	else
+		_baseline='通过（没有 btrfs-subvols / extroot fstab 迹象）'
+	fi
+	_mb=$(image_size_mb "$IMAGE_SIZE")
+
+	say "=== phase1 镜像构建计划（--image：只打印，不写盘、不 mkfs、不碰 /dev）==="
+	say ""
+	say "镜像文件      : ${IMAGE}（大小 ${IMAGE_SIZE} = ${_mb}M，未压缩）"
+	say "rootfs 源     : $ROOTFS"
+	say "内核          : $KERNEL  -> grub 路径 $KERNEL_PATH"
+	say "initrd        : $INITRD  -> grub 路径 $INITRD_PATH"
+	say "引导分区前缀  : ${BOOT_SUBDIR:-<FAT 根>}"
+	say "btrfs 标签    : ${BTRFS_LABEL}（--btrfs-label）"
+	say "@data 子卷    : $([ "$WITH_DATA_SUBVOL" = 1 ] && echo '建（--with-data-subvol）' || echo '不建')"
+	say "rootfs 基线   : ${_baseline}"
+	say "安全边界      : 只写 ${IMAGE} 这一个普通文件；不碰 /dev 下任何整盘；不需要人工 yes"
+	say ""
+	say "--- 1) 建文件并挂成 loop ---"
+	say "  truncate -s ${IMAGE_SIZE} ${IMAGE}"
+	say "  losetup --find --show --partscan ${IMAGE}   # partscan = -P，让内核感知分区"
+	say "  （失败退化：losetup -f --show + partx -u；分区节点最多等 10s）"
+	say ""
+	say "--- 2) 分区表（p2 物理最后，首启扩容只重建 p2）---"
+	say "  sgdisk --zap-all <loop>"
+	say "  p1    FAT32  ${BOOT_SIZE}   ef00  phase1-boot  -> mkfs.vfat -F 32 -n PHASE1BOOT"
+	say "  p128  EF02   ${ESP_SIZE}    ef02  phase1-core  -> GRUB core.img"
+	say "  p2    btrfs  至镜像末尾     8300  phase1-root  -> mkfs.btrfs -f -L ${BTRFS_LABEL}"
+	say ""
+	say "--- 3) 子卷（只建在 p2 上）---"
+	say "  ${SUBVOLS}"
+	say "  @docker / @swap 打完 mkfs 立刻 chattr +C（必须空目录时设置才生效）"
+	say ""
+	say "--- 4) 解包 @root + manifest ---"
+	say "  源    : $ROOTFS"
+	say "  排除  : /proc /sys /dev /tmp /run /boot /rom /overlay /opt/docker /swap /data"
+	say "  manifest : <@root>/.ab-base-manifest（<path><TAB>sha256，条目 <1000 直接失败）"
+	say ""
+	say "--- 5) 引导分区 + grub ---"
+	say "  拷贝  : $KERNEL -> <p1>$KERNEL_PATH"
+	say "  拷贝  : $INITRD -> <p1>$INITRD_PATH"
+	say "  grub-install --target=i386-pc --boot-directory=<p1>/${BOOT_SUBDIR} --modules=\"${GRUB_MODULES}\" <loop>"
+	say "  渲染  : phase1/grub/grub.cfg.in -> <p1>$(boot_prefix)/grub/grub.cfg（只有 0 号项）"
+	say "  试跑标记  : 不创建（最终镜像的 0 号项就是唯一入口）"
+	say ""
+	say "--- 6) cmdline（渲染后自动校验）---"
+	say "  0 号项 : $CMDLINE"
+	say "  根设备 : 由 initrd 烘焙（phase1/make-initramfs.sh --rootdev），镜像的 grub.cfg 不含 phase1_dev="
+	say ""
+	say "--- 7) 收尾与清理 ---"
+	say "  btrfs subvolume list 比对恰为 ${SUBVOLS}"
+	say "  umount <p1> / <p2> && losetup -d <loop>（trap 保证失败时也执行）"
+	say "  产物  : ${IMAGE}（未压缩；gzip 与 sha256 由 phase1/build.sh 负责）"
+	say ""
+	say "dry-run 结束：没有对任何设备或文件执行写操作。"
+}
+
+image_write() {
+	IMAGE_LOOP=''
+	IMAGE_P1_ON=0
+	IMAGE_P2_ON=0
+	trap image_teardown EXIT
+	trap 'image_teardown 130' INT
+	trap 'image_teardown 143' TERM HUP
+
+	say "=== 镜像文件模式（只写 ${IMAGE}）==="
+	say "  rootfs 源 : $ROOTFS"
+	say "  内核      : $KERNEL  -> ${KERNEL_PATH}"
+	say "  initrd    : $INITRD  -> ${INITRD_PATH}"
+
+	# 1) 建文件 + 挂 loop
+	say "  1) 建镜像文件 + loop"
+	say "  \$ truncate -s ${IMAGE_SIZE} ${IMAGE}"
+	: >"$IMAGE" || fail "无法创建镜像文件: ${IMAGE}" "确认父目录存在且可写（不要指向 /dev 下的设备）"
+	truncate -s "$IMAGE_SIZE" "$IMAGE" || fail "truncate 失败: ${IMAGE}" "确认磁盘空间够 ${IMAGE_SIZE}"
+	IMAGE_LOOP=$(losetup --find --show --partscan "$IMAGE" 2>/dev/null) || IMAGE_LOOP=''
+	if [ -z "$IMAGE_LOOP" ]; then
+		IMAGE_LOOP=$(losetup -f --show "$IMAGE" 2>/dev/null) || IMAGE_LOOP=''
+	fi
+	[ -n "$IMAGE_LOOP" ] || fail "losetup 失败: ${IMAGE}" "确认 loop 模块可用（modprobe loop），且该镜像没有被别的 loop 占着"
+	say "  loop 设备 : ${IMAGE_LOOP}"
+	IMAGE_P1=$(derive_part "$IMAGE_LOOP" 1)
+	IMAGE_P2=$(derive_part "$IMAGE_LOOP" 2)
+
+	# 2) 分区表（与真装机同一套几何，只是目标换成 loop）
+	say "  2) 分区表：p1 -> p128 -> p2（p2 物理最后）"
+	say "  \$ sgdisk --zap-all ${IMAGE_LOOP}"
+	sgdisk --zap-all "$IMAGE_LOOP" || fail "sgdisk --zap-all 失败: ${IMAGE_LOOP}" "确认 loop 设备未被占用"
+	say "  \$ sgdisk --set-alignment=2048 --new=1:0:+${BOOT_SIZE} --new=128:0:+${ESP_SIZE} --new=2:0:0 ${IMAGE_LOOP}"
+	sgdisk --set-alignment=2048 \
+		--new=1:0:+"$BOOT_SIZE" --typecode=1:ef00 --change-name=1:phase1-boot \
+		--new=128:0:+"$ESP_SIZE" --typecode=128:ef02 --change-name=128:phase1-core \
+		--new=2:0:0 --typecode=2:8300 --change-name=2:phase1-root \
+		"$IMAGE_LOOP" || fail "sgdisk 建分区失败" "确认 ${IMAGE_SIZE} 够 ${BOOT_SIZE} + ${ESP_SIZE} + rootfs"
+	if command -v partx >/dev/null 2>&1; then
+		# 新写出来的分区表在 loop 上第一次要"add"，之后才是"update"；两条都试，失败不算硬错
+		# （losetup -P 已置 PARTSCAN 时内核自己会扫出来）
+		partx -a "$IMAGE_LOOP" 2>/dev/null || partx -u "$IMAGE_LOOP" 2>/dev/null ||
+			warn "partx 失败（只要分区节点随后出现就不影响结果）"
+	fi
+	image_wait_part "$IMAGE_P1" || fail "分区节点缺失: ${IMAGE_P1}" "手工 partx -u ${IMAGE_LOOP} 后重跑"
+	image_wait_part "$IMAGE_P2" || fail "分区节点缺失: ${IMAGE_P2}" "手工 partx -u ${IMAGE_LOOP} 后重跑"
+
+	# 3) 文件系统 + 子卷
+	say "  3) 文件系统 + 子卷"
+	say "  \$ mkfs.vfat -F 32 -n PHASE1BOOT ${IMAGE_P1}"
+	mkfs.vfat -F 32 -n PHASE1BOOT "$IMAGE_P1" || fail "mkfs.vfat 失败: ${IMAGE_P1}" "确认 p1 是 ${BOOT_SIZE} 的 ef00 分区"
+	say "  \$ mkfs.btrfs -f -L ${BTRFS_LABEL} ${IMAGE_P2}"
+	mkfs.btrfs -f -L "$BTRFS_LABEL" "$IMAGE_P2" || fail "mkfs.btrfs 失败: ${IMAGE_P2}" "确认 p2 存在且未挂载"
+	mkdir -p "$DATA_MNT" || fail "无法创建挂载点 $DATA_MNT" "确认 /mnt 可写"
+	# 挂载点已占用时叠挂会让 postcheck_subvols 读到别的东西、teardown 的 umount 只摘顶层
+	# ⇒ loop 变 busy、losetup -d 只 warn，等于"留半个 loop 设备"。所以先查。
+	if mountpoint_present "$DATA_MNT"; then
+		fail "挂载点 ${DATA_MNT} 已被占用（并发构建或上次失败的残留）" "先 umount ${DATA_MNT}（必要时 umount -l）再重跑"
+	fi
+	mount -t btrfs -o noatime "$IMAGE_P2" "$DATA_MNT" || fail "挂载 p2 失败: ${IMAGE_P2}" "确认 mkfs.btrfs 已成功"
+	IMAGE_P2_ON=1
+	for _s in $SUBVOLS; do
+		say "  \$ btrfs subvolume create $DATA_MNT/$_s"
+		btrfs subvolume create "$DATA_MNT/$_s" || fail "建子卷失败: $_s" "确认 p2 空间与挂载状态"
+	done
+	chattr +C "$DATA_MNT/@docker" 2>/dev/null || warn "chattr +C @docker 失败（确认 e2fsprogs 已装）"
+	chattr +C "$DATA_MNT/@swap" 2>/dev/null || warn "chattr +C @swap 失败（确认 e2fsprogs 已装）"
+
+	# 4) 解包 + manifest
+	say "  4) 解包 @root + manifest"
+	extract_rootfs "$ROOTFS" "$DATA_MNT/@root"
+	mkdir -p "$DATA_MNT/@overlay/upper" "$DATA_MNT/@overlay/work" ||
+		fail "无法建 upper/work" "确认 @overlay 子卷创建成功"
+	write_manifest "$DATA_MNT/@root"
+	sync
+
+	# 5) 引导分区 + grub
+	say "  5) 引导分区 + grub"
+	mkdir -p "$BOOT_MNT" || fail "无法创建挂载点 $BOOT_MNT" "确认 /mnt 可写"
+	if mountpoint_present "$BOOT_MNT"; then
+		fail "挂载点 ${BOOT_MNT} 已被占用（并发构建或上次失败的残留）" "先 umount ${BOOT_MNT}（必要时 umount -l）再重跑"
+	fi
+	mount -t vfat "$IMAGE_P1" "$BOOT_MNT" || fail "挂载 p1 失败: ${IMAGE_P1}" "确认 mkfs.vfat 已成功"
+	IMAGE_P1_ON=1
+	install_grub "$KERNEL" "$INITRD" "$IMAGE_LOOP" "--no-floppy --no-recheck"
+	_grubdir=$BOOT_MNT$(boot_prefix)/grub
+	mkdir -p "$_grubdir" || fail "无法创建 $_grubdir" "确认 p1 已挂载"
+	render_cfg "$_grubdir" || fail "渲染 grub.cfg 失败" "检查 --cmdline 是否满足硬规则"
+	# 最终镜像**不**创建试跑标记：0 号项就是唯一入口
+	sync
+	umount "$BOOT_MNT" || fail "卸载镜像 p1 失败: $BOOT_MNT" "确认没有进程占着 $BOOT_MNT"
+	IMAGE_P1_ON=0
+
+	# 6) 收尾比对
+	say "  6) 收尾比对"
+	postcheck_subvols
+	umount "$DATA_MNT" || fail "卸载镜像 p2 失败: $DATA_MNT" "确认没有进程占着 $DATA_MNT"
+	IMAGE_P2_ON=0
+
+	losetup -d "$IMAGE_LOOP" 2>/dev/null || warn "losetup -d $IMAGE_LOOP 失败（镜像文件可继续使用）"
+	IMAGE_LOOP=''
+	trap - EXIT INT TERM HUP
+
+	_sum=$(sha256_of "$IMAGE" 2>/dev/null) || _sum='<无 sha256sum/shasum>'
+	_size=$(wc -c <"$IMAGE" | tr -d ' ')
+	say ''
+	say "镜像完成（未压缩）: ${IMAGE}"
+	say "  大小   : ${_size} 字节"
+	say "  sha256 : ${_sum}"
+	say '  下一步: gzip -9 -n 压缩并写 .sha256（phase1/build.sh 负责）'
+}
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
+# 镜像文件模式最先分流：--image 与 --disk/--grub-dir/--trial 互斥，校验在写任何字节之前
+if [ -n "$IMAGE" ] || [ -n "$IMAGE_SIZE" ]; then
+	image_validate
+	if [ "$DRY_RUN" = 1 ]; then
+		print_image_plan
+		exit 0
+	fi
+	require_image_inputs
+	check_rootfs_baseline
+	image_check_platform
+	image_check_tools
+	image_write
+	exit 0
+fi
+
 if [ -n "$PRESERVE" ] && [ -z "$GRUB_DIR" ]; then
 	usage_fail "--preserve-existing 必须与 --grub-dir DIR 一起用（它只渲染 grub.cfg，不装机）"
 fi

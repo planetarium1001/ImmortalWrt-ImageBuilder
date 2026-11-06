@@ -21,7 +21,7 @@ echo "== \$VAR 后紧跟非 ASCII 字符时必须用 \${VAR}（macOS bash 3.2 �
 bad_lines=$(perl -ne '
 	next if /^\s*#/;
 	print "$ARGV:$.: $_" if /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]/;
-' $(git ls-files 'files/usr/sbin/*' 'files/etc/init.d/*' 'files/etc/uci-defaults/*' 'files/lib/preinit/*' 'phase1/*.sh' 'phase1/tests/*.sh' 'phase1/tools/*.sh' 'shell/tests/*.sh' 'shell/*.sh' 'x86-64/*.sh' 2>/dev/null) 2>/dev/null)
+' $(git ls-files 'files/usr/sbin/*' 'files/etc/init.d/*' 'files/etc/uci-defaults/*' 'files/lib/preinit/*' 'phase1/*.sh' 'phase1/tests/*.sh' 'phase1/tools/*.sh' 'phase1/dev/rootfs/etc/uci-defaults/*' 'phase1/firstboot/rootfs/etc/uci-defaults/*' 'shell/tests/*.sh' 'shell/*.sh' 'x86-64/*.sh' 2>/dev/null) 2>/dev/null)
 if [ -z "$bad_lines" ]; then
 	ok "没有 \$VAR 紧邻非 ASCII 的写法"
 else

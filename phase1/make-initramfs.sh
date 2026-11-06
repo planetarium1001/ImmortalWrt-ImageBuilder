@@ -25,9 +25,9 @@
 #   --help
 #
 # 载荷（N.7 + 真机血泪坑）：
-#   bin/busybox、lib/{libc.so, ld-musl-x86_64.so.1, libubox.so.20260213, libgcc_s.so.1}、
+#   bin/busybox、lib/{libc.so, ld-musl-x86_64.so.1, libubox.so.<版本日期>, libgcc_s.so.1}、
 #   sbin/kmodloader（+ modprobe/insmod/rmmod/lsmod 软链）、
-#   lib/modules/$KVER/ 的 10 个 btrfs 依赖 ko + modules.builtin{,.modinfo}、
+#   lib/modules/$KVER/ 的 10 个 btrfs 依赖 ko + modules.builtin（.modinfo 可选）、
 #   vfat/fat/nls_cp437/nls_iso8859-1/nls_utf8（写 p1 日志必需，v4/v5 就是缺它才"零痕迹"）、
 #   usr/bin/{getfattr,setfattr}（N.3 要求：共享 upper 换 lower 要判 opaque/whiteout）
 #
@@ -216,10 +216,24 @@ log "cpio    = $(cpio_flavour)"
 
 _missing=''
 for _f in bin/busybox sbin/kmodloader \
-          lib/libc.so lib/ld-musl-x86_64.so.1 lib/libubox.so.20260213 lib/libgcc_s.so.1 \
-          "lib/modules/$KVER/modules.builtin" "lib/modules/$KVER/modules.builtin.modinfo"; do
+          lib/libc.so lib/ld-musl-x86_64.so.1 lib/libgcc_s.so.1 \
+          "lib/modules/$KVER/modules.builtin"; do
 	[ -e "$STAGE/$_f" ] || _missing="$_missing $_f"
 done
+# libubox 的文件名带版本日期（libubox.so.<日期>），**不能改名**：kmodloader 的 DT_NEEDED 就是它自己
+# 那一版的 soname，改了名动态链接器就找不到库，initrd 里连模块都加载不起来。所以这里按 glob 认。
+_lu=''
+for _c in "$STAGE"/lib/libubox.so.*; do
+	if [ -e "$_c" ]; then
+		_lu=$_c
+	fi
+done
+[ -n "$_lu" ] || _missing="$_missing lib/libubox.so.<版本>"
+# modules.builtin.modinfo 在裁剪过的 rootfs 里常被剥掉（只有 modules.builtin 是 kmodloader 必需）：
+# 缺了只告警，不拦构建。
+if [ ! -e "$STAGE/lib/modules/$KVER/modules.builtin.modinfo" ]; then
+	log "WARN: STAGE 没有 lib/modules/$KVER/modules.builtin.modinfo（可选文件，继续）"
+fi
 for _m in $MODULES_BTRFS $MODULES_FS; do
 	[ -f "$STAGE/lib/modules/$KVER/$_m.ko" ] || _missing="$_missing lib/modules/$KVER/$_m.ko"
 done
@@ -366,7 +380,16 @@ for _m in $MODULES_BTRFS $MODULES_FS; do
 	[ -f "$EX/lib/modules/$KVER/$_m.ko" ] || die "归档里缺模块: lib/modules/$KVER/$_m.ko"
 done
 [ -f "$EX/lib/modules/$KVER/modules.builtin" ] || die "归档里缺 modules.builtin"
-[ -f "$EX/lib/modules/$KVER/modules.builtin.modinfo" ] || die "归档里缺 modules.builtin.modinfo"
+_lu_ex=''
+for _c in "$EX"/lib/libubox.so.*; do
+	if [ -e "$_c" ]; then
+		_lu_ex=$_c
+	fi
+done
+[ -n "$_lu_ex" ] || die "归档里缺 lib/libubox.so.<版本>（kmodloader 的 soname 依赖）"
+if [ ! -e "$EX/lib/modules/$KVER/modules.builtin.modinfo" ]; then
+	log "WARN: 归档里没有 modules.builtin.modinfo（可选）"
+fi
 for _b in $XATTR_BINS; do
 	if [ -f "$EX/usr/bin/$_b" ]; then
 		log "xattr bin : usr/bin/$_b"

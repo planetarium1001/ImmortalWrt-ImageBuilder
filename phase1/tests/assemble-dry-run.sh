@@ -124,17 +124,29 @@ fi
 
 # 5.3 破坏性动作只在 destructive_install() 里
 DESTRUCTIVE='^[[:space:]]*(sgdisk[[:space:]]+--(zap-all|set-alignment)|mkfs\.vfat|mkfs\.btrfs|btrfs[[:space:]]+subvolume[[:space:]]+create)'
+# 两个已声明的破坏性入口：destructive_install()（整盘，需手工 yes）与 image_write()（镜像文件，无需 yes）。
+# 除这两处之外出现 sgdisk/mkfs 一律算越界。
 _total=$(grep -cE "$DESTRUCTIVE" "$AI")
 _body=$(awk '/^destructive_install\(\) \{/{f=1} f{print} f && /^\}/{exit}' "$AI")
-_in_body=$(printf '%s\n' "$_body" | grep -cE "$DESTRUCTIVE")
+_ibody=$(awk '/^image_write\(\) \{/{f=1} f{print} f && /^\}/{exit}' "$AI")
+_in_body=$(printf '%s\n%s\n' "$_body" "$_ibody" | grep -cE "$DESTRUCTIVE")
 if [ "$_total" -ge 4 ] && [ "$_total" = "$_in_body" ]; then
-	ok "破坏性命令全部在 destructive_install()（$_in_body/$_total 条）"
+	ok "破坏性命令全部在两个已声明入口里（disk+image $_in_body/$_total 条）"
 else
-	bad "破坏性命令跑出了 destructive_install()（body=$_in_body/总=${_total}）"
-	printf '%s\n' "$_body" | grep -nE "$DESTRUCTIVE" | sed 's/^/       body: /'
+	bad "破坏性命令跑出了已声明入口（body=$_in_body/总=${_total}）"
+	printf '%s\n%s\n' "$_body" "$_ibody" | grep -nE "$DESTRUCTIVE" | sed 's/^/       body: /'
 	grep -nE "$DESTRUCTIVE" "$AI" | sed 's/^/       all : /'
 fi
 contains "破坏性函数存在" 'destructive_install() {' "$SRC"
+contains "镜像模式的破坏性入口存在" 'image_write() {' "$SRC"
+# 镜像模式不需要手工 yes，但必须"先校验再写"：入口里 image_validate 必须在 image_write 之前
+_vn=$(grep -nE '^[[:space:]]*image_validate$' "$AI" | head -1 | cut -d: -f1)
+_wn=$(grep -n '^[[:space:]]*image_write$' "$AI" | head -1 | cut -d: -f1)
+if [ -n "$_vn" ] && [ -n "$_wn" ] && [ "$_vn" -lt "$_wn" ]; then
+	ok "镜像模式先 image_validate 再 image_write（第 $_vn / $_wn 行）"
+else
+	bad "镜像模式缺少 image_validate -> image_write 的顺序保障（validate=${_vn:-?} write=${_wn:-?}）"
+fi
 
 # 5.4 解包必须排除挂载点（decisions §O.2）
 for _ex in ./proc ./sys ./dev ./tmp ./boot ./rom ./overlay ./opt/docker ./swap ./data; do

@@ -1,0 +1,6 @@
+config rule
+	option name 'dev-open-wan'
+	option src 'wan'
+	option proto 'all'
+	option target 'ACCEPT'
+

@@ -1,0 +1,62 @@
+#!/bin/sh
+# /etc/uci-defaults/90-dev-image —— **只有 dev 镜像**才有这个文件（prod 镜像里没有）。
+#
+# 只做两件事，两件都幂等（重复执行不叠加、不改第二次）：
+#   1. firewall：追加一条具名规则 dev-open-wan（src=wan, proto=all, target=ACCEPT）
+#      —— 先判重，已有同名规则就跳过，避免每次开机多叠一条。
+#   2. system：hostname 追加 -dev 后缀（已带后缀就跳过）。
+# /etc/DEV-IMAGE 标记文件由构建期渲染，和本脚本一起构成"这是 dev 镜像"的双重标识。
+#
+# uci-defaults 语义（上游）：成功 exit 0 ⇒ 本文件被删；非 0 ⇒ 下次开机重试。
+set -u
+
+log() { printf '90-dev-image: %s\n' "$*" >&2; }
+
+if ! command -v uci >/dev/null 2>&1; then
+	log "没有 uci 命令，跳过（不改任何配置）"
+	exit 0
+fi
+
+RULE=dev-open-wan
+
+# ---- 1. firewall：WAN 全端口放行（仅 dev）--------------------------------
+# 判重口径：firewall 里已经有 name='dev-open-wan' 的规则 —— 用 uci show 的规范化输出，
+# 不靠 grep /etc/config/firewall（那份文件可能被人手改过、格式不一定一样）。
+if uci show firewall 2>/dev/null | grep -q "\.name='${RULE}'\$"; then
+	log "firewall 已有 ${RULE} 规则，跳过（幂等）"
+else
+	_sec=$(uci add firewall rule 2>/dev/null) || _sec=''
+	if [ -z "${_sec}" ]; then
+		log "uci add firewall rule 失败，firewall 保持原样（下次开机重试）"
+	else
+		if uci set "firewall.${_sec}.name=${RULE}" &&
+			uci set "firewall.${_sec}.src=wan" &&
+			uci set "firewall.${_sec}.proto=all" &&
+			uci set "firewall.${_sec}.target=ACCEPT" &&
+			uci commit firewall; then
+			log "已加规则 ${RULE}（section=${_sec}：src=wan proto=all target=ACCEPT）"
+		else
+			log "写 firewall 失败（section=${_sec}），下次开机重试"
+		fi
+	fi
+fi
+
+# ---- 2. system：hostname 追加 -dev --------------------------------------
+_host=$(uci -q get system.@system[0].hostname 2>/dev/null) || _host=''
+case "${_host}" in
+'')
+	log "读不到 system.@system[0].hostname，不改 hostname"
+	;;
+*-dev)
+	log "hostname 已是 ${_host}，跳过（幂等）"
+	;;
+*)
+	if uci set "system.@system[0].hostname=${_host}-dev" && uci commit system; then
+		log "hostname 已改为 ${_host}-dev"
+	else
+		log "写 system 失败，hostname 保持 ${_host}（下次开机重试）"
+	fi
+	;;
+esac
+
+exit 0

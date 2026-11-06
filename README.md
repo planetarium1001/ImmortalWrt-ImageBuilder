@@ -112,6 +112,7 @@
 ## 文档
 
 - [安装与首次启动](docs/install.md)：写盘、首启重启与建 p3、进入后台、升级与恢复出厂
+  （附录 B 是 Phase 1 可刷镜像的取产物 / 写盘 / 首启说明，实验路径）
 - [锐捷认证](docs/ruijie.md)：minieap 配置与排障
 - [网络与端口](docs/network.md)：端口分配、改口、AP 模式、NAT66
 - [家/校双 profile](docs/profile.md)：`netprofile` 切换、防检测一档/二档、记忆机制
@@ -125,7 +126,8 @@
 - `x86-64/`：目标配置、构建脚本、机型手册
 - `files/`：随固件打包的配置与首启脚本
 - `shell/`：第三方包准备、代理源接入、验收测试
-- `.github/workflows/`：构建与清理
+- `phase1/`：Phase 1（只读 btrfs 子卷根 + 独立写层）的构建与装机链，含 CI 可刷镜像入口
+- `.github/workflows/`：固件构建、Phase 1 镜像构建、历史运行清理
 
 ## 许可与致谢
 

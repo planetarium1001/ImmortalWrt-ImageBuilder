@@ -30,6 +30,13 @@
 
 # 上面这段说明只留在模板里；渲染时会整段丢弃，渲染结果里不会出现这些字样。
 #@TEMPLATE_HEADER_END@
+# 串口控制台：真机（r38135）的 grub.cfg 就是这么开的，无显示器/无键盘时它是唯一能看到
+# GRUB 阶段的通道。core.img 里的 serial/mod 与 terminal.mod 由 assemble-image.sh 的
+# --modules 保证存在（缺了会在解析这段时报 unknown command）。
+serial --unit=0 --speed=115200
+terminal_input console serial
+terminal_output console serial
+
 set timeout=@TIMEOUT@
 set default=0
 set fallback=0

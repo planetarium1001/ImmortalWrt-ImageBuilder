@@ -5,11 +5,14 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 W="$ROOT/.github/workflows"
 FAIL=0
 
+# 2026-11-07：新增第三条 workflow（Phase 1 btrfs 可刷镜像，Build-phase1-btrfs.yml）。
+# 数量断言继续按白名单精确比对：多一条就得在这里显式登记，避免 workflow 目录被随手塞东西。
 count=$(ls "$W" | wc -l | tr -d ' ')
-[ "$count" = "2" ] && echo "ok: workflow 数量为 2" || { echo "FAIL: workflow 数量为 $count"; ls "$W"; FAIL=1; }
+[ "$count" = "3" ] && echo "ok: workflow 数量为 3" || { echo "FAIL: workflow 数量为 $count"; ls "$W"; FAIL=1; }
 
 [ -f "$W/Build-N5105-x86_64-25.12.x.yml" ] && echo "ok: 构建 workflow 命名正确" || { echo "FAIL: 缺 Build-N5105-x86_64-25.12.x.yml"; FAIL=1; }
 [ -f "$W/Cleanup-Old-Workflow-Runs.yml" ] && echo "ok: 清理 workflow 命名正确" || { echo "FAIL: 缺 Cleanup-Old-Workflow-Runs.yml"; FAIL=1; }
+[ -f "$W/Build-phase1-btrfs.yml" ] && echo "ok: Phase 1 镜像 workflow 命名正确" || { echo "FAIL: 缺 Build-phase1-btrfs.yml"; FAIL=1; }
 
 B="$W/Build-N5105-x86_64-25.12.x.yml"
 grep -q "^name: Build N5105 x86_64 25.12.x" "$B" && echo "ok: 显示名正确" || { echo "FAIL: 显示名未更新"; FAIL=1; }

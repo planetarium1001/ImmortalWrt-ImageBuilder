@@ -1,0 +1,5 @@
+type=@TYPE@
+built_at=@BUILD_TIME@
+git_sha=@GIT_SHA@
+note=dev 构建：WAN 全端口放行（firewall 规则 dev-open-wan）+ hostname 追加 -dev。
+note=本文件由 phase1/build.sh 从 phase1/dev/rootfs/etc/DEV-IMAGE.in 渲染；prod 镜像里不存在。

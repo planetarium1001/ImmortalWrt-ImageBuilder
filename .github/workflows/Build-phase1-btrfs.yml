@@ -1,0 +1,484 @@
+name: Build phase1 btrfs image
+
+# Phase 1 可刷镜像：p1(vfat 256M) + p128(EF02 4M) + p2(btrfs 余量)，物理顺序 p1 < p128 < p2，
+# 子卷固定 @root / @overlay / @docker / @swap。
+#
+# 内容基线**固定**为 commit fe53232 的 files/ + PACKAGES（PRD 硬要求），再叠加 HEAD 的
+# files/lib/preinit/80_mount_root（§O.1 fstools 守卫补丁）。不要换成 HEAD 的 files/：
+# HEAD 时代基座带 btrfs-subvols / overlay-setup / 79-btrfs，phase1/assemble-image.sh 会硬失败。
+#
+# 判据不内联在本文件里：镜像自检走 phase1/tools/image-selfcheck.sh（CI 与本地用同一份），
+# --image 模式真跑走 phase1/tests/assemble-image-mode.sh（PHASE1_IMAGE_REAL=1）。
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "镜像类型：prod = 正式镜像；dev = 开发镜像（WAN 全端口放行 + /etc/DEV-IMAGE）"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - dev
+          - prod
+      luci_version:
+        description: "ImageBuilder 的 luci 版本"
+        required: false
+        default: "25.12.2"
+        type: choice
+        options:
+          - 25.12.0
+          - 25.12.1
+          - 25.12.2
+      include_docker:
+        description: "是否集成 docker 插件"
+        required: false
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+      image_size:
+        description: "镜像文件尺寸（分区表按此建，首启自动扩到盘尾）"
+        required: false
+        default: "8G"
+        type: string
+      custom_router_ip:
+        description: "路由器管理地址（仅对多网口路由器有效）"
+        required: false
+        default: "192.168.100.1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          # 下面要 `git archive fe53232` 取内容基线：浅克隆在本地没有这个 commit。
+          fetch-depth: 0
+
+      - name: Materialize fe53232 baseline content
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="$RUNNER_TEMP/phase1-base"
+          mkdir -p "$BASE"
+
+          # 内容基线 = commit fe53232（不是 HEAD 的 files/）。只取构建要用的三个目录。
+          git archive fe53232 files x86-64 shell | tar -x -C "$BASE"
+          echo "baseline: fe53232 的 files/ + x86-64/ + shell/"
+
+          # 叠加 Phase 1 补丁：HEAD 的 §O.1 fstools 守卫版 80_mount_root（fe53232 里没有 lib/preinit/）。
+          # 镜像内 /lib/preinit/80_mount_root 必须与本文件逐字节一致（ac-3）。
+          mkdir -p "$BASE/files/lib/preinit"
+          cp files/lib/preinit/80_mount_root "$BASE/files/lib/preinit/80_mount_root"
+          echo "patched: files/lib/preinit/80_mount_root（HEAD 版本覆盖基线）"
+          sha256sum "$BASE/files/lib/preinit/80_mount_root" files/lib/preinit/80_mount_root
+
+          # 基线里出现 HEAD 时代的这些文件就必须立刻停下：
+          # phase1/assemble-image.sh 对这类 rootfs 默认硬失败（phase1/README.md §4.1）。
+          legacy=0
+          for p in \
+            etc/init.d/btrfs-subvols \
+            etc/uci-defaults/95-overlay-setup.sh \
+            lib/preinit/79-btrfs \
+            usr/sbin/overlay-setup; do
+            if [ -e "$BASE/files/$p" ]; then
+              echo "::error::基线里出现 HEAD 时代文件 files/${p}：assemble-image.sh 会拒绝这份 rootfs"
+              legacy=1
+            fi
+          done
+          if [ "$legacy" != 0 ]; then
+            echo "基线校验失败：内容基线必须是 fe53232 的 files/（叠加 80_mount_root 之后）"
+            exit 1
+          fi
+          echo "baseline guard: btrfs-subvols / overlay-setup / 79-btrfs 均不在基线内"
+
+          # initrd 依赖（attr + vfat + nls），但**不能**写进 shell/apk-custom-packages.sh：
+          # 那份文件一旦非空，x86-64/build25.sh 就会走"第三方商店"分支（git clone wukongdaily/apk
+          # + 塞第三方 apk），产物不再是 fe53232 基线。
+          # 正确做法是在 build25.sh 的 `make image` 之前直接拼 PACKAGES。
+          sed -i '/^make image/i PACKAGES="$PACKAGES attr kmod-fs-vfat kmod-nls-cp437 kmod-nls-iso8859-1 kmod-nls-utf8"' \
+            "$BASE/x86-64/build25.sh"
+          grep -n 'kmod-nls-utf8' "$BASE/x86-64/build25.sh"
+          if grep -q 'kmod-nls-utf8' "$BASE/shell/apk-custom-packages.sh"; then
+            echo "::error::apk-custom-packages.sh 被污染（会触发第三方商店分支）"
+            exit 1
+          fi
+          echo "CUSTOM_PACKAGES 注入点: $BASE/x86-64/build25.sh（apk-custom-packages.sh 保持基线原样）"
+          sha256sum "$BASE/shell/apk-custom-packages.sh"
+
+      - name: Build rootfs with ImageBuilder
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="$RUNNER_TEMP/phase1-base"
+          WORK="$RUNNER_TEMP/phase1-work"
+          mkdir -p "$BASE/bin" "$BASE/custom" "$WORK"
+
+          luci_version="${{ inputs.luci_version }}"
+          include_docker="${{ inputs.include_docker }}"
+          # custom_router_ip 沿用现有 workflow 的做法：只挂**单个文件**。
+          # 整目录挂到 files/etc/config 会遮住 network/dhcp/firewall 等定制配置。
+          echo "${{ inputs.custom_router_ip }}" > "$BASE/custom/custom_router_ip.txt"
+          echo "router ip: ${{ inputs.custom_router_ip }}"
+
+          # 失败即 job 失败：set -o pipefail 让 docker 的非 0 退出码穿过 tee 透传出来
+          docker run --rm -i \
+            --user root \
+            -v "$BASE/bin:/home/build/immortalwrt/bin" \
+            -v "$BASE/files:/home/build/immortalwrt/files" \
+            -v "$BASE/custom/custom_router_ip.txt:/home/build/immortalwrt/files/etc/config/custom_router_ip.txt" \
+            -v "$BASE/x86-64/imm25.config:/home/build/immortalwrt/.config" \
+            -v "$BASE/shell:/home/build/immortalwrt/shell" \
+            -v "$BASE/x86-64/build25.sh:/home/build/immortalwrt/build.sh" \
+            -e INCLUDE_DOCKER="$include_docker" \
+            -e PROFILE=512 \
+            "immortalwrt/imagebuilder:x86-64-openwrt-${luci_version}" /bin/bash /home/build/immortalwrt/build.sh \
+            2>&1 | tee "$WORK/build.sh.log"
+
+          echo "--- 基线的 make image 行（ROOTFS_PARTSIZE 取 \$PROFILE，由 -e PROFILE=512 提供）---"
+          grep -n 'make image' "$BASE/x86-64/build25.sh" || true
+          echo "--- ImageBuilder 产物 ---"
+          ls -lh "$BASE/bin/targets/x86/64/"
+
+      - name: Extract rootfs and kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="$RUNNER_TEMP/phase1-base"
+          WORK="$RUNNER_TEMP/phase1-work"
+          TARGETS="$BASE/bin/targets/x86/64"
+          mkdir -p "$WORK"
+          rm -rf "$WORK/rootfs"
+          mkdir -p "$WORK/rootfs"
+          SQ_LOOP=""
+          BOOT_LOOP=""
+          cleanup() {
+            set +e
+            sudo umount "$WORK/mnt-efi" 2>/dev/null
+            if [ -n "$BOOT_LOOP" ]; then sudo losetup -d "$BOOT_LOOP" 2>/dev/null; fi
+            if [ -n "$SQ_LOOP" ]; then sudo losetup -d "$SQ_LOOP" 2>/dev/null; fi
+          }
+          trap cleanup EXIT
+
+          # 组合镜像（squashfs-combined-efi）要解压两次（rootfs 与内核各一次），只 gunzip 一遍
+          combined_img() {
+            if [ -f "$WORK/combined.img" ]; then
+              printf '%s' "$WORK/combined.img"
+              return 0
+            fi
+            shopt -s nullglob
+            local imgs=("$TARGETS"/*squashfs-combined-efi.img.gz)
+            shopt -u nullglob
+            if [ "${#imgs[@]}" -eq 0 ]; then
+              return 1
+            fi
+            gunzip -c "${imgs[0]}" > "$WORK/combined.img"
+            printf '%s' "$WORK/combined.img"
+          }
+
+          # ---- A) rootfs ----
+          shopt -s nullglob
+          tars=("$TARGETS"/*rootfs.tar.gz)
+          shopt -u nullglob
+          rootfs_done=0
+          if [ "${#tars[@]}" -gt 0 ]; then
+            echo "rootfs source: tar.gz ${tars[0]}"
+            tar -xzf "${tars[0]}" -C "$WORK/rootfs"
+            rootfs_done=1
+          fi
+          if [ "$rootfs_done" = 0 ]; then
+            if ! cimg=$(combined_img); then
+              echo "::error::$TARGETS 里既没有 rootfs.tar.gz 也没有 squashfs-combined-efi.img.gz"
+              ls -R "$BASE/bin/targets" || true
+              exit 1
+            fi
+            sudo apt-get update -qq
+            sudo apt-get install -y squashfs-tools util-linux >/dev/null
+            SQ_LOOP=$(sudo losetup -fP --show "$cimg")
+            sq=""
+            for dev in $(sudo lsblk -nlo NAME,TYPE "$SQ_LOOP" | awk '$2 == "part" {print $1}'); do
+              if sudo blkid "/dev/$dev" 2>/dev/null | grep -q 'TYPE="squashfs"'; then
+                sq="/dev/$dev"
+                break
+              fi
+            done
+            if [ -z "$sq" ]; then
+              echo "::error::loop $SQ_LOOP 上找不到 squashfs 分区"
+              sudo lsblk -f "$SQ_LOOP" || true
+              exit 1
+            fi
+            echo "rootfs source: unsquashfs $sq"
+            sudo unsquashfs -d "$WORK/rootfs" "$sq"
+            sudo losetup -d "$SQ_LOOP"
+            SQ_LOOP=""
+          fi
+
+          # ---- B) 内核三段式（x86 的 ImageBuilder 通常**不**在 rootfs 里放 /boot/vmlinuz） ----
+          KERNEL=""
+          shopt -s nullglob
+          kbins=("$TARGETS"/*-kernel.bin)
+          shopt -u nullglob
+          if [ "${#kbins[@]}" -gt 0 ]; then
+            cp "${kbins[0]}" "$WORK/vmlinuz"
+            KERNEL="$WORK/vmlinuz"
+            echo "kernel source: kernel.bin ${kbins[0]}"
+          fi
+          if [ -z "$KERNEL" ] && [ -f "$WORK/rootfs/boot/vmlinuz" ]; then
+            cp "$WORK/rootfs/boot/vmlinuz" "$WORK/vmlinuz"
+            KERNEL="$WORK/vmlinuz"
+            echo "kernel source: rootfs/boot/vmlinuz"
+          fi
+          if [ -z "$KERNEL" ]; then
+            # 3) 组合镜像的引导分区（vfat）里的 vmlinuz
+            if cimg=$(combined_img); then
+              mkdir -p "$WORK/mnt-efi"
+              BOOT_LOOP=$(sudo losetup -fP --show "$cimg")
+              bootpart=""
+              for dev in $(sudo lsblk -nlo NAME,TYPE "$BOOT_LOOP" | awk '$2 == "part" {print $1}'); do
+                if sudo blkid -s TYPE -o value "/dev/$dev" 2>/dev/null | grep -q '^vfat$'; then
+                  bootpart="/dev/$dev"
+                  break
+                fi
+              done
+              if [ -n "$bootpart" ] && sudo mount -o ro "$bootpart" "$WORK/mnt-efi"; then
+                for cand in "$WORK/mnt-efi/boot/vmlinuz" "$WORK/mnt-efi/vmlinuz"; do
+                  if sudo test -s "$cand"; then
+                    sudo cp "$cand" "$WORK/vmlinuz"
+                    KERNEL="$WORK/vmlinuz"
+                    echo "kernel source: combined image boot partition $bootpart（${cand##*/}）"
+                    break
+                  fi
+                done
+                sudo umount "$WORK/mnt-efi" || true
+              fi
+              sudo losetup -d "$BOOT_LOOP" || true
+              BOOT_LOOP=""
+            fi
+          fi
+
+          if [ -z "$KERNEL" ] || [ ! -s "$KERNEL" ]; then
+            echo "::error::三条内核来源都没有找到 vmlinuz（*-kernel.bin / rootfs/boot/vmlinuz / 组合镜像 boot 分区）"
+            ls -l "$TARGETS" || true
+            ls -l "$WORK/rootfs/boot" || true
+            exit 1
+          fi
+          sudo chmod 644 "$WORK/vmlinuz"
+          echo "kernel: $KERNEL（$(stat -c%s "$WORK/vmlinuz") bytes）"
+          sha256sum "$WORK/vmlinuz"
+          echo "KERNEL=$KERNEL" >> "$GITHUB_ENV"
+
+          echo "rootfs top-level:"
+          ls "$WORK/rootfs"
+          df -h "$RUNNER_TEMP"
+
+      - name: Install host tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          # phase1/assemble-image.sh 的 image_check_tools 要这些：缺一个就硬失败在构建中途。
+          # grub-pc-bin 提供 i386-pc 模块树与 core.img（只有 grub-common 时 grub-install 必失败）。
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            gdisk dosfstools btrfs-progs grub-pc-bin grub-common util-linux coreutils e2fsprogs \
+            cpio squashfs-tools
+          for t in sgdisk mkfs.vfat mkfs.btrfs btrfs grub-install losetup partx truncate cpio \
+            grub-script-check mkfs.ext4; do
+            command -v "$t" >/dev/null || {
+              echo "::error::宿主机缺工具: $t"
+              exit 1
+            }
+          done
+          echo "宿主机工具齐备"
+          df -h "$RUNNER_TEMP"
+
+      - name: Build phase1 image
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/phase1-work"
+          OUT="$RUNNER_TEMP/phase1-out"
+          mkdir -p "$OUT"
+          mode="${{ inputs.mode }}"
+          KERNEL="${KERNEL:?KERNEL 未导出：Extract rootfs and kernel 步骤没跑成}"
+          if [ ! -s "$KERNEL" ]; then
+            echo "::error::内核文件不存在: ${KERNEL}"
+            exit 1
+          fi
+
+          avail_kb=$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 {print $4}')
+          avail_g=$((avail_kb / 1024 / 1024))
+          echo "可用空间: ${avail_g} GiB（$RUNNER_TEMP）；image_size=${{ inputs.image_size }}；kernel=$KERNEL"
+          if [ "$avail_g" -lt 20 ]; then
+            echo "::warning::$RUNNER_TEMP 只剩 ${avail_g} GiB：8G 镜像 + rootfs 解包可能放不下"
+          fi
+
+          # 单一入口 phase1/build.sh：解包/注入 → initrd → assemble-image.sh --image → .img.gz
+          sudo bash phase1/build.sh \
+            --type "$mode" \
+            --rootfs "$WORK/rootfs" \
+            --kernel "$KERNEL" \
+            --image-out "$OUT/immortalwrt-phase1-${mode}-x86-64.img.gz" \
+            --size "${{ inputs.image_size }}" \
+            2>&1 | tee "$WORK/phase1-build.log"
+
+          # 包基线取证：CUSTOM_PACKAGES 必须为空（否则 build25.sh 走了第三方商店分支），
+          # 且最终 PACKAGES 里必须有我们 sed 注入的 initrd 依赖。
+          CUSTOM=$(grep -m1 '第三方apk软件包' "$WORK/build.sh.log" | sed 's/^[^:]*: *//' || true)
+          PKGS=$(awk '/Building image with the following packages/ {getline; print; exit}' "$WORK/build.sh.log" || true)
+          {
+            echo "CUSTOM_PACKAGES=[${CUSTOM}]"
+            echo "PACKAGES=${PKGS}"
+          } | tee "$WORK/pkg-baseline.txt"
+          if [ -n "$CUSTOM" ]; then
+            echo "::error::CUSTOM_PACKAGES 非空（=[${CUSTOM}]）：基线被第三方商店污染"
+            exit 1
+          fi
+          case "$PKGS" in
+          *kmod-nls-utf8*) ;;
+          *)
+            echo "::error::最终 PACKAGES 里没有 kmod-nls-utf8（initrd 依赖没注入）"
+            exit 1
+            ;;
+          esac
+          ls -lh "$OUT"
+
+      - name: Self-check image
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/phase1-work"
+          OUT="$RUNNER_TEMP/phase1-out"
+          mode="${{ inputs.mode }}"
+          IMG_GZ="$OUT/immortalwrt-phase1-${mode}-x86-64.img.gz"
+
+          # /init 的 sha256 由 phase1/build.sh 打印（INIT_SHA=<sha>），ac-3 靠它与镜像里的逐个比对
+          INIT_SHA=$(grep -oE 'INIT_SHA=[0-9a-f]{64}' "$WORK/phase1-build.log" | tail -1 | cut -d= -f2 || true)
+          if [ -z "$INIT_SHA" ]; then
+            echo "::error::构建日志里没有 INIT_SHA=（phase1/build.sh 必须打印）"
+            tail -20 "$WORK/phase1-build.log" || true
+            exit 1
+          fi
+          echo "INIT_SHA=$INIT_SHA"
+
+          set +e
+          sudo sh phase1/tools/image-selfcheck.sh "$IMG_GZ" --mode "$mode" --init-sha "$INIT_SHA" \
+            2>&1 | tee "$WORK/selfcheck.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "### 自检（mode=${mode}）"
+            echo '```'
+            cat "$WORK/selfcheck.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 镜像已解压/自检完：raw img 与 rootfs tree 都很大，先腾空间再算 sha256
+          rm -rf "$WORK/rootfs"
+          df -h "$RUNNER_TEMP" || true
+
+          if [ "$rc" != 0 ]; then
+            echo "::error::镜像自检失败（rc=$rc）"
+            exit 1
+          fi
+          gz=$(basename "$IMG_GZ")
+          ( cd "$OUT" && sha256sum "$gz" | tee "$gz.sha256" )
+
+      - name: Verify --image mode end-to-end
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ac-1 的"从零产出镜像"必须真跑：造 3G 镜像 → loop 挂回去 → 验布局/子卷/manifest/grub.cfg。
+          # 变量必须交给 sudo 自己设（`VAR=1 sudo …` 会被 sudoers 的 env_reset 丢掉而静默走 PEND）。
+          sudo env PHASE1_IMAGE_REAL=1 sh phase1/tests/assemble-image-mode.sh
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-phase1-${{ inputs.mode }}-x86-64
+          path: |
+            ${{ runner.temp }}/phase1-out/*.img.gz
+            ${{ runner.temp }}/phase1-out/*.img.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-build-logs-${{ inputs.mode }}
+          path: |
+            ${{ runner.temp }}/phase1-work/*.log
+            ${{ runner.temp }}/phase1-work/*.txt
+            ${{ runner.temp }}/phase1-base/bin/targets/x86/64/.config
+            ${{ runner.temp }}/phase1-base/bin/targets/x86/64/*.manifest
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/phase1-work"
+          OUT="$RUNNER_TEMP/phase1-out"
+          mode="${{ inputs.mode }}"
+          IMG_GZ="$OUT/immortalwrt-phase1-${mode}-x86-64.img.gz"
+          {
+            echo "## Phase 1 btrfs image（mode=${mode}）"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| mode | \`$mode\` |"
+            echo "| luci_version | \`${{ inputs.luci_version }}\` |"
+            echo "| include_docker | \`${{ inputs.include_docker }}\` |"
+            echo "| image_size | \`${{ inputs.image_size }}\` |"
+            echo "| custom_router_ip | \`${{ inputs.custom_router_ip }}\` |"
+            echo "| 内容基线 | \`fe53232\` 的 files/ + PACKAGES，叠加 HEAD 的 80_mount_root |"
+            echo "| 自检 | \`phase1/tools/image-selfcheck.sh\`（布局/子卷/内容/引导/initrd/dev-prod） |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f "$IMG_GZ" ]; then
+            echo "| 产物 | 值 |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| 文件 | \`$(basename "$IMG_GZ")\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| gz 大小 | $(du -h "$IMG_GZ" | awk '{print $1}') |" >> "$GITHUB_STEP_SUMMARY"
+            if [ -f "$IMG_GZ.sha256" ]; then
+              echo "| sha256 | \`$(awk '{print $1}' "$IMG_GZ.sha256")\` |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "产物缺失：${IMG_GZ}（构建或自检未通过，日志见 phase1-build-logs-${mode}）" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # 包基线：证明没有走 build25.sh 的第三方商店分支
+          if [ -f "$WORK/pkg-baseline.txt" ]; then
+            echo "<details><summary>包基线（CUSTOM_PACKAGES 必须为空）</summary>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$WORK/pkg-baseline.txt" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          for f in "$WORK/selfcheck.txt"; do
+            if [ -f "$f" ]; then
+              echo "<details><summary>$(basename "$f")</summary>" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              head -n 200 "$f" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done

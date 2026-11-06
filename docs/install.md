@@ -378,3 +378,63 @@ dmesg | grep -i 'tmpfs overlay' # 期望为空
 ```
 
 注意：**现网 extroot 系统的 `/` 行同样含 `upperdir=/overlay/upper`**（`lowerdir=/`），所以只看 `upperdir` 会把 live 误判成通过；必须连 `lowerdir=/lower` 一起看。
+
+---
+
+## 附录 B：Phase 1 可刷镜像（CI 产出 `.img.gz`，**实验路径**）
+
+> 状态（2026-11-07）：CI 能产出可整盘直写的 `.img.gz`（p1 vfat + p128 EF02 + p2 btrfs，子卷 `@root`/`@overlay`/`@docker`/`@swap`），
+> 但**还没有人把它写到真盘上验证过**。先按附录 A 的判据在设备上验收，再考虑把它变成默认路径。
+> 细节以 [`../phase1/README.md`](../phase1/README.md) §5.5 / §5.6 为准。
+
+### B.1 取产物
+
+1. 打开 Actions → **Build phase1 btrfs image** → *Run workflow*；
+2. 选 `mode`：
+   - **`prod`**：正式镜像，不含任何 WAN 放行规则；
+   - **`dev`**：开发镜像，首启自动加 `dev-open-wan`（`src=wan, proto=all, target=ACCEPT`）+ hostname 追加 `-dev` + `/etc/DEV-IMAGE` 标记。
+     **只在开发/调试机用**，别当正式版发出去。
+3. 其它输入：`luci_version`（默认 25.12.2）、`include_docker`（默认 yes）、`image_size`（默认 8G）、`custom_router_ip`（默认 `192.168.100.1`）；
+4. 跑完在该 run 的 Artifacts 里下载 `immortalwrt-phase1-<mode>-x86-64`，里面有 `.img.gz` 与 `.img.gz.sha256`。
+
+### B.2 校验与写入
+
+```sh
+shasum -a 256 -c immortalwrt-phase1-prod-x86-64.img.gz.sha256   # 先校验
+gzip -t immortalwrt-phase1-prod-x86-64.img.gz                    # 再确认没坏
+
+# macOS：拔下 NVMe（或接到 USB 转接），确认目标盘（diskutil list 里的 /dev/diskN）
+gunzip -c immortalwrt-phase1-prod-x86-64.img.gz | sudo dd of=/dev/rdiskN bs=8m status=progress
+sync
+```
+
+- **`of=` 必须是整盘**（`/dev/rdiskN`、Linux 上是 `/dev/nvme0n1`），不是分区；
+- 镜像里的根设备默认按 **NVMe** 烘焙（`/dev/nvme0n1p2` / `/dev/nvme0n1p1`）。写到 SATA/USB 盘时必须用
+  `phase1/build.sh --rootdev /dev/sda2 --bootdev /dev/sda1` 重新构建，否则内核起来后 `/init` 找不到根；
+- p2 在镜像里只有 `image_size` 那么大，**首启会自动把它扩到整盘末尾**（幂等；日志在 `/boot/phase1-grow.log` 与 `dmesg`）：
+  - "已满 / 不是本布局 / 几何异常 / 缺工具" ⇒ 什么都不做（`exit 0`，脚本用完即删）；
+  - **瞬时失败**（`sgdisk` 写不进去、`partx` 没重读、`btrfs resize` 失败）⇒ `exit 1`，脚本被保留、**下次开机会自动重试**，
+    且不阻断启动。手工补一次也行：`btrfs filesystem resize max /overlay`。
+- `dev` 镜像的 WAN 全放行规则（`dev-open-wan`：`src=wan, proto=all, target=ACCEPT`）**在镜像的
+  `/etc/config/firewall` 里就已经存在**（构建期写入；`/etc/uci-defaults/90-dev-image` 只是兜底且按名字判重）。
+  `prod` 镜像里全树搜不到 `dev-open-wan`、也没有 `/etc/DEV-IMAGE`。
+
+### B.3 首启会发生什么
+
+1. GRUB（p1）读 `grub.cfg` → 内核 + initrd（`rdinit=/init`）；
+2. `/init` 先挂 `@overlay`（带 `compress=zstd:1`）再挂 `@root` ro → 合成 overlay → `switch_root`；
+3. `/etc/uci-defaults/` 里的脚本按序执行：`10-grow-p2.sh`（扩 p2）、dev 镜像还有 `90-dev-image`（放行 WAN + hostname）；
+4. 之后按第 6 节进后台（管理地址默认 `192.168.100.1`）。
+
+**dev 镜像**此时应能直接从 WAN 侧 SSH（全端口放行）；`prod` 镜像不会。
+
+### B.4 与主流程（附录 A 之前的 1–11 节）的关系
+
+| 项 | 当前发布镜像（squashfs + p3 extroot） | Phase 1 CI 镜像 |
+|---|---|---|
+| 根 | p2 squashfs | p2 btrfs 子卷 `@root`（ro） |
+| 写层 | p3 `@overlay`（fstools extroot） | 同一块 p2 上的 `@overlay`（initramfs 挂） |
+| 分区 | p1 + p2 + p3(+p128) | p1 + p128 + **p2 至盘尾**（没有 p3） |
+| 升级 | `sysupgrade` | 换 `@root` 子卷（Phase 2，未做） |
+
+两者**不能混用**：Phase 1 镜像会重建整盘分区表，刷上去等于新装，p3 上的数据不会保留。

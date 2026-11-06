@@ -1,7 +1,9 @@
 # phase1/ —— Phase 1 装机链（只读 btrfs 子卷根 + 独立 overlay 写层）
 
-这一目录是 Phase 1 的**构建与装机骨架**。本轮只做到"可在开发机上静态验证 + dry-run"：
-**没有真机分区、没有刷机**。真机验证由 tm-03 按 `prd.md` 的 ac-8..ac-12 取证。
+这一目录是 Phase 1 的**构建与装机骨架**。`20261106-btrfs-root-phase1` 已把引导链做到真机可用
+（ac-8…ac-14 全 PASS）；`20261107-btrfs-root-image-ci` 在此基础上补上 **CI 可刷镜像**：
+`phase1/build.sh` 单一入口 + `assemble-image.sh --image` 镜像文件模式 + `dev`/`prod` 两种构建类型。
+**镜像本身还没刷过真机**（用户拔盘写、下一任务验）。
 
 权威依据（有冲突以它们为准）：
 
@@ -20,6 +22,13 @@
 | `phase1/tests/fixtures/grub.cfg.device-r38135` | 真机 `/boot/grub/grub.cfg` 的结构拷贝（18 行 / 826 字节；**两块盘的 PARTUUID 已匿名化**为 `00000000-…-00000000000{1,2}`，md5 `1c52ef71d322462703cee86dd34acd50`，文件内不含任何注释），`--preserve-existing` 的用例输入 | 只读 fixture；出处与原始 md5 见同目录 `.provenance` |
 | `phase1/tests/fixtures/grub.cfg.device-r38135.provenance` | 上面这个 fixture 的出处（来源路径 / 版本 r38135 / 取回时间 2026-11-06 / md5 / 第 3 条是 spick 遗留项） | 只读说明 |
 | `phase1/make-initramfs.sh`、`phase1/initramfs/init` | initrd 构建与 `/init` 引导链（teammate tm-02 的产出，本目录只读参考） | 见各自文件 |
+| `phase1/build.sh` | **CI 单一入口**：解包 rootfs → 注入 firstboot(+dev) → 组 initrd 的 STAGE → `make-initramfs.sh` → `assemble-image.sh --image` → `gzip -9` + sha256 | 已实现；离线用 `--prepare-rootfs` / `--dry-run` 验 |
+| `phase1/dev/rootfs/**` | **仅 dev 镜像**注入：`etc/DEV-IMAGE`（模板 `.in`）+ `etc/uci-defaults/90-dev-image`（首启写 `dev-open-wan` 全放行 + hostname `-dev`） | 已实现；`phase1/tests/dev-mode-content.sh` 断言 |
+| `phase1/firstboot/rootfs/etc/uci-defaults/10-grow-p2.sh` | **两种类型都注入**：首启把 p2 扩到盘尾（幂等，失败不阻断启动） | 已实现；`phase1/tests/firstboot-grow.sh` 用桩断言 |
+| `phase1/tests/assemble-image-mode.sh` | ac-1：`--image` 参数校验 / dry-run 计划 / 失败也拆 loop / Linux 真跑（`PHASE1_IMAGE_REAL=1`） | `sh phase1/tests/assemble-image-mode.sh` |
+| `phase1/tests/dev-mode-content.sh` | ac-4：dev vs prod 的注入差异（真跑 `--prepare-rootfs` 后比对） | `sh phase1/tests/dev-mode-content.sh` |
+| `phase1/tests/firstboot-grow.sh` | ac-5：扩容脚本 6 个场景（真跑脚本 + 桩 `sgdisk`/`partx`/`btrfs`） | `sh phase1/tests/firstboot-grow.sh` |
+| `.github/workflows/Build-phase1-btrfs.yml` | CI：`workflow_dispatch` 选 `mode=dev\|prod`，产出 `.img.gz` + sha256，并在 runner 上做布局/内容/dev-vs-prod 自检 | 已实现；`sh shell/tests/phase1-workflow-shape.sh` 断言结构 |
 
 ## 2. 装配几何（Phase 1 装机即按此，避免将来重刷）
 
@@ -205,6 +214,80 @@ sh phase1/assemble-image.sh \
    格式 `path<TAB>sha256`，条目数会打印（预期数千）；
 7. 脚本里没有递归强制删除，也没有通配删除（`phase1/tests/assemble-dry-run.sh` 会静态断言这一条）。
 
+### 5.5 镜像文件模式（`--image`，CI 用；只写一个普通文件）
+
+```sh
+# 在 Linux + root 上：从零产出一个可 dd 的镜像（不碰 /dev 下的任何整盘，因此不需要人工 yes）
+sudo sh phase1/assemble-image.sh --image out.img --size 8G \
+	--rootfs phase1-rootfs.tar.gz --kernel vmlinuz --initrd initrd.cpio.gz
+
+# 同一套计划（任何机器都能跑，一个字节都不写）
+sh phase1/assemble-image.sh --dry-run --image out.img --size 8G \
+	--rootfs phase1-rootfs.tar.gz --kernel vmlinuz --initrd initrd.cpio.gz
+```
+
+- 步骤与真装机同源：`truncate` → `losetup --find --show --partscan` → `sgdisk`（p1/p128/p2）→
+  `mkfs.vfat`/`mkfs.btrfs` → 子卷（`chattr +C`）→ 解包 `@root` + `/.ab-base-manifest` →
+  内核/initrd/`grub.cfg` → `grub-install --target=i386-pc` → 卸载 → `losetup -d`。
+- **`--image` 只产出未压缩 `.img`**；`gzip -9 -n` 与 `.sha256` 由 `phase1/build.sh` 负责。
+- 互斥：`--image` 不能与 `--disk` / `--grub-dir` / `--trial` 同时用；输出路径不许落在 `/dev/` 或是块设备；
+  `--size` 下限 2G（`8G` 或 `8192M` 两种写法）。
+- 覆盖已有非空镜像要显式 `--force-overwrite`（默认拒绝：随后的 `truncate` 不可逆）。
+- 挂载点 `/mnt/phase1-{boot,btrfs}` 被占用（并发构建 / 上次失败残留）时**硬失败**并提示先 `umount`：
+  叠挂会让子卷比对读到别的盘、`umount` 只摘顶层、loop 变 busy。
+- **失败也会拆 loop**：`trap image_teardown EXIT INT TERM HUP` 负责 `umount` + `losetup -d`，
+  用例用桩验证过这条路径（`phase1/tests/assemble-image-mode.sh` §4）。
+- 镜像里的根设备来自 **initrd 烘焙的默认值**（`build.sh --rootdev/--bootdev`，默认 `/dev/nvme0n1p2`、`/dev/nvme0n1p1`）：
+  最终镜像的 `grub.cfg` 仍**不含** `phase1_dev=` 键（0 号项口径见 §3 的渲染校验）。
+  **dd 到别的盘型（SATA/USB）必须用 `--rootdev/--bootdev` 重建 initrd。**
+
+### 5.6 CI 单一入口 `phase1/build.sh` 与 `dev`/`prod`
+
+```sh
+# 完整构建（CI 就是这么调的）：rootfs + 内核 → initrd → .img.gz + sha256
+sudo sh phase1/build.sh --type prod --rootfs /path/rootfs --kernel /path/vmlinuz \
+	--image-out out.img.gz --size 8G
+
+# 只做"解包 + 注入"（离线可跑，用例走这条）：不碰 loop/分区/grub
+sh phase1/build.sh --type dev --rootfs /path/rootfs --prepare-rootfs /tmp/prepared \
+	--kernel vmlinuz --image-out /dev/null --size 8G
+
+# 只打印将执行的完整 argv（与真跑同一份 argv，不是另写一份计划文本）
+sh phase1/build.sh --type dev --rootfs /path/rootfs --kernel vmlinuz \
+	--image-out out.img.gz --size 8G --dry-run
+```
+
+`--type` **必填**且只认 `dev|prod`（不设默认值：这两个是安全边界）。差异**只在注入层**，静态可判定：
+
+| 项 | dev | prod |
+|---|---|---|
+| `/etc/config/firewall` 的 `dev-open-wan` 规则（`src=wan, proto=all, target=ACCEPT`） | 首启由 `/etc/uci-defaults/90-dev-image` 写入（幂等） | 不写；镜像里没有这个脚本 |
+| hostname 后缀 `-dev` | 同上脚本追加（幂等） | 无 |
+| `/etc/DEV-IMAGE` 标记（含 type/built_at/git_sha） | 有（构建期从 `DEV-IMAGE.in` 渲染） | 无 |
+| `/etc/uci-defaults/10-grow-p2.sh`（首启扩容） | 有 | 有 |
+
+STAGE（initrd 载荷）**缺任何一项就失败并点名到包**（`kmod-fs-btrfs`/`kmod-fs-vfat`/`kmod-nls-*`/`attr`/`libgcc`/`libubox`），
+不做"半残 initrd"。`--work DIR` 可复用，但每次会先清空 `<WORK>/rootfs` 与 `<WORK>/stage`
+（否则上一次 dev 注入会污染下一次 prod），且 `--work` 会 `pwd -P` 规范化并拒绝 `/`、`/tmp`、`/home` 这类系统目录。
+
+- **`libubox` 不改名**：STAGE 里放的必须是 rootfs 里那个 `libubox.so.<版本日期>` 的**原名**（kmodloader 的
+  `DT_NEEDED` 就是它自己那版的 soname，改名 ⇒ initrd 里连 `btrfs.ko` 都加载不起来）。
+- **`INIT_SHA=<sha256>`**：每次构建都打印这一行（渲染 `/init` 的所有参数与真跑完全一致；`--dry-run` 也会在
+  `TMPDIR` 里临时渲染后删除来打印它）。CI 用它和镜像内 initrd 里的 `/init` 做逐字比对（ac-3）。
+- **大小闸**：压 `gzip` 之前断言镜像的实际字节数**恰好等于** `--size`（`8G`/`8192M`/`512K` 都支持解析）。
+  不等就 `die` —— 半成品镜像绝不会被压成 `.img.gz` 当成功产物。
+- **dev 的 WAN 放行是"镜像里就有"**：`--type dev` 在构建期把 `phase1/dev/rootfs/etc/config/firewall.dev-rule`
+  append 进镜像的 `/etc/config/firewall`（判重幂等，末尾没换行会先补）；首启的 `90-dev-image` 保留作兜底，
+  它按规则名判重所以不会叠第二条。**
+
+### 5.7 首启扩容的失败语义（`10-grow-p2.sh`）
+
+- **不该重试**的分支 `exit 0`：p2 已到盘尾（already-full）、根分区号不是 2、几何异常
+  （`p128.start >= p2.start`）、推不出整盘、缺 `sgdisk`/`partx`/`btrfs`。
+- **瞬时失败**（`sgdisk -e`/`sgdisk -d -n`/`partx` 两路都失败/`btrfs filesystem resize max` 失败）`exit 1`：
+  uci-defaults 只在 `exit 0` 时删除脚本，所以 `exit 1` = **下次开机自动重试**，且**不阻断启动**。
+- 日志：`/boot/phase1-grow.log` + `/dev/kmsg`（能写才写）。
+
 ## 6. 真机试跑（GRUB 路径，唯一被完整证明过的路径）
 
 ### 6.1 真机前置（缺一条就别开跑）
@@ -314,8 +397,10 @@ live 的 `/boot` 最终指向 `p1:/boot`（`79_move_config` 先把 p1 挂到 `/b
 
 ## 8. 下一轮待办
 
-- **CI 入口**：在 `x86-64/build25.sh` 旁新增 phase1 构建入口（组装 `rootfs.tar.gz` + `vmlinuz` + initrd
-  并调用本脚本），本轮不做。
+- ~~**CI 入口**：在 `x86-64/build25.sh` 旁新增 phase1 构建入口~~ —— 已由
+  `phase1/build.sh` + `.github/workflows/Build-phase1-btrfs.yml` 完成（见 §5.5 / §5.6）。
+- **镜像刷真机**：`20261107-btrfs-root-image-ci` 的产物还没写过盘；首启扩容（`10-grow-p2.sh`）
+  与 dev 镜像的 WAN 全放行只在离线用例里验过（桩），真机首启属下一任务。
 - 真机刷机前：用 `phase1/tools/device-verify.sh` 把 ac-8…ac-14 固化成可复跑检查（本轮已落地）。
 - 真机确认最终几何后，固定 `--boot-subdir` 与标记路径，并删掉兜底路径（`/try-phase1`）。
 - Phase 2：换基座复验（设计见任务 `research/phase2-3-device-tests.md` 第 2 节）。
@@ -323,8 +408,13 @@ live 的 `/boot` 最终指向 `p1:/boot`（`79_move_config` 先把 p1 挂到 `/b
 ## 9. 自测
 
 ```sh
-sh phase1/tests/grub-cfg.sh          # ac-5：模板渲染语义
-sh phase1/tests/assemble-dry-run.sh  # ac-6：dry-run + 静态安全约束
+sh phase1/tests/grub-cfg.sh            # ac-5：模板渲染语义
+sh phase1/tests/assemble-dry-run.sh    # ac-6：dry-run + 静态安全约束
+sh phase1/tests/assemble-image-mode.sh # ac-1：--image 参数校验 / dry-run 计划 / 失败拆 loop / Linux 真跑
+sh phase1/tests/dev-mode-content.sh    # ac-4：dev vs prod 注入差异（真跑 --prepare-rootfs）
+sh phase1/tests/firstboot-grow.sh      # ac-5：首启扩容 6 场景（真跑脚本 + 桩命令）
+# 一次跑完全部（含 shell/tests 与 phase1/tests）：
+sh shell/tests/all.sh
 ```
 
 两个用例都只用 POSIX sh + 仓库内 `shell/tests/lib-assert.sh`；已在 macOS 的 `/bin/sh`（bash 3.2）与
