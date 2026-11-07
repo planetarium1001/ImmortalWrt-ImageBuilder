@@ -318,6 +318,7 @@ jobs:
           set -euo pipefail
           WORK="$RUNNER_TEMP/phase1-work"
           OUT="$RUNNER_TEMP/phase1-out"
+          BASE="$RUNNER_TEMP/phase1-base"
           mkdir -p "$OUT"
           mode="${{ inputs.mode }}"
           KERNEL="${KERNEL:?KERNEL 未导出：Extract rootfs and kernel 步骤没跑成}"
@@ -364,7 +365,13 @@ jobs:
             exit 1
             ;;
           esac
-          grep -q 'kmod-nls-utf8' "$BASE/x86-64/build25.sh" || {
+          PATCHED="$BASE/x86-64/build25.sh"
+          if [ ! -f "$PATCHED" ]; then
+            echo "::error::找不到被 sed 补过的基线脚本: ${PATCHED}（Materialize 步骤没跑成？）"
+            ls -l "$BASE/x86-64" 2>/dev/null || true
+            exit 1
+          fi
+          grep -q 'kmod-nls-utf8' "$PATCHED" || {
             echo "::error::基线 build25.sh 里没有被 sed 注入 PACKAGES 追加行"
             exit 1
           }
