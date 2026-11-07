@@ -392,7 +392,8 @@ dmesg | grep -i 'tmpfs overlay' # 期望为空
 1. 打开 Actions → **Build phase1 btrfs image** → *Run workflow*；
 2. 选 `mode`：
    - **`prod`**：正式镜像，不含任何 WAN 放行规则；
-   - **`dev`**：开发镜像，首启自动加 `dev-open-wan`（`src=wan, proto=all, target=ACCEPT`）+ hostname 追加 `-dev` + `/etc/DEV-IMAGE` 标记。
+   - **`dev`**：开发镜像，首启自动加 `dev-open-wan`（`src=wan, proto=all, target=ACCEPT`）+ hostname 追加 `-dev` + `/etc/DEV-IMAGE` 标记
+     + **内置调试公钥** `/etc/dropbear/authorized_keys`（构建期注入，目录 0700 / 文件 0600）。
      **只在开发/调试机用**，别当正式版发出去。
 3. 其它输入：`luci_version`（默认 25.12.2）、`include_docker`（默认 yes）、`image_size`（默认 8G）、`custom_router_ip`（默认 `192.168.100.1`）；
 4. 跑完在该 run 的 Artifacts 里下载 `immortalwrt-phase1-<mode>-x86-64`，里面有 `.img.gz` 与 `.img.gz.sha256`。
@@ -427,6 +428,29 @@ sync
 4. 之后按第 6 节进后台（管理地址默认 `192.168.100.1`）。
 
 **dev 镜像**此时应能直接从 WAN 侧 SSH（全端口放行）；`prod` 镜像不会。
+
+### B.3.1 首启后怎么登录（dev：无显示器/键盘/串口）
+
+dev 镜像里**没有任何 root 密码**（出厂为空，dropbear 拒绝空密码登录），唯一的登录材料是构建期注入的调试公钥。
+私钥在仓库的 `.workflow/assets/router-ssh/`（该目录被 `.gitignore` 整体忽略，**不进版本库**；换机器需重新生成并重刷镜像）。
+
+```sh
+# 1) 在上游路由器的 DHCP 客户端列表里找 hostname 带 "-dev" 的那台，记下它拿到的 WAN IP（如 192.168.2.37）
+# 2) 用项目专用私钥登录（不要用 ~/.ssh 里的默认身份）
+ssh -i .workflow/assets/router-ssh/n5105_dev_ed25519 -o IdentitiesOnly=yes root@<那个 IP>
+```
+
+进去第一件事（dev 的 WAN 是全开的，别裸奔）：
+
+```sh
+uci set dropbear.@dropbear[0].PasswordAuth='off'   # 只留公钥
+uci commit dropbear
+uci show firewall | grep dev-open-wan              # 确认规则在（镜像里就有）
+```
+
+> **失败判定线**：上电后 **10 分钟**内既在上游 DHCP 列表里看不到 `-dev` 设备、也连不上 ⇒
+> 直接拔盘重写（这台机器没有串口也没有显示输出，引导失败的原因是**看不见**的）。
+> 兜底通道只有一条：插 LAN 口（eth1/eth2/eth3）+ 笔记本 DHCP 拿 `192.168.100.100–199` → `http://192.168.100.1`（LuCI 首次登录会让你设 root 密码）。
 
 ### B.4 与主流程（附录 A 之前的 1–11 节）的关系
 

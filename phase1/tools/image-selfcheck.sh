@@ -9,8 +9,9 @@
 #
 # 参数：
 #   <img.gz|img>      产物（.gz 自动 gunzip 到临时目录；.img 直接挂）
-#   --mode dev|prod   dev 必须有 /etc/DEV-IMAGE + /etc/uci-defaults/90-dev-image + firewall 里的 dev-open-wan；
-#                     prod 三者都不许有
+#   --mode dev|prod   dev 必须有 /etc/DEV-IMAGE + /etc/uci-defaults/90-dev-image + firewall 里的 dev-open-wan
+#                     + /etc/dropbear/authorized_keys（0700/0600，无外设设备的唯一登录通道）；
+#                     prod 这些都不许有（含任何 SSH 公钥）
 #   --init-sha SHA    期望的 initrd 内 /init 的 sha256（phase1/build.sh 打印的 INIT_SHA=<sha>）；
 #                     给了就逐字比对，不给只打印（ac-3 的"与 initrd-build 证据一致"就靠这一条）
 #   --manifest-min N  .ab-base-manifest 最少行数（默认 1000）
@@ -284,10 +285,51 @@ if mount -o ro,subvol=@root "${LOOP}p2" "$MNT_ROOT" 2>/dev/null; then
 		else
 			fail "dev: /etc/uci-defaults/90-dev-image 缺失"
 		fi
+		# 镜像内的 firewall 必须**构建期**就带规则（90-dev-image 只是兜底）：
+		# handoff §6 记录的判据缺口——dev 分支此前只断言首启脚本，没有断言镜像本体。
+		if grep -q "option name 'dev-open-wan'" "$MNT_ROOT/etc/config/firewall" 2>/dev/null; then
+			pass "dev: /etc/config/firewall 含 dev-open-wan（构建期写入）"
+		else
+			fail "dev: /etc/config/firewall 里没有 dev-open-wan（规则没在构建期写进镜像）"
+		fi
+		# 调试公钥：无外设设备唯一的登录通道，缺了就只能拔盘重写。
+		# 路径语义见 .workflow/knowledge/fact/active/2026-11-07-openwrt-dropbear-root-etc-dropbear-autho.md
+		if [ -d "$MNT_ROOT/etc/dropbear" ]; then
+			_dperm=$(stat -c '%a' "$MNT_ROOT/etc/dropbear" 2>/dev/null || echo '?')
+			if [ "$_dperm" = 700 ]; then
+				pass "dev: /etc/dropbear 目录权限 0700"
+			else
+				fail "dev: /etc/dropbear 目录权限是 ${_dperm}（要求 0700，dropbear 拒绝 group/other 可写的目录）"
+			fi
+		else
+			fail "dev: /etc/dropbear 目录缺失"
+		fi
+		AK=$MNT_ROOT/etc/dropbear/authorized_keys
+		if [ -f "$AK" ]; then
+			pass "dev: /etc/dropbear/authorized_keys 存在"
+			_aperm=$(stat -c '%a' "$AK" 2>/dev/null || echo '?')
+			if [ "$_aperm" = 600 ]; then
+				pass "dev: authorized_keys 权限 0600"
+			else
+				fail "dev: authorized_keys 权限是 ${_aperm}（要求 0600）"
+			fi
+			if grep -qE '^(ssh-ed25519|ssh-rsa) AAAA' "$AK" 2>/dev/null; then
+				pass "dev: authorized_keys 含合法公钥行"
+			else
+				fail "dev: authorized_keys 里没有 ssh-ed25519/ssh-rsa 公钥行"
+			fi
+			if cmp -s "$AK" "$REPO/phase1/dev/rootfs/etc/dropbear/authorized_keys"; then
+				pass "dev: authorized_keys 与仓库 HEAD 逐字节一致"
+			else
+				fail "dev: authorized_keys 与仓库 phase1/dev/rootfs/etc/dropbear/authorized_keys 不一致"
+			fi
+		else
+			fail "dev: /etc/dropbear/authorized_keys 缺失（刷到无外设设备上无法 SSH 登录）"
+		fi
 	else
-		for _f in etc/DEV-IMAGE etc/uci-defaults/90-dev-image; do
+		for _f in etc/DEV-IMAGE etc/uci-defaults/90-dev-image etc/dropbear/authorized_keys; do
 			if [ -e "$MNT_ROOT/$_f" ]; then
-				fail "prod: /${_f} 不该存在（prod 镜像不得带 dev 专有文件）"
+				fail "prod: /${_f} 不该存在（prod 镜像不得带 dev 专有文件/认证材料）"
 			else
 				pass "prod: /${_f} 不存在"
 			fi

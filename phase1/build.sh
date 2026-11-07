@@ -580,6 +580,27 @@ inject_dev_firewall() { # <目标 rootfs tree>
 	printf '  注入 firewall 规则 dev-open-wan（src=wan proto=all target=ACCEPT）\n'
 }
 
+# dev 镜像的调试公钥：dropbear 对 root 读 /etc/dropbear/authorized_keys
+# （OpenWrt patch 100-pubkey_path，见 .workflow/knowledge/fact/active/2026-11-07-openwrt-dropbear-root-etc-dropbear-autho.md）。
+# 该 patch 只校验**目录**不可被 group/other 写，文件权限是卫生要求；但 git 只记录 644/755，
+# 检出到工作区/CI 的都是 0644，所以必须在构建期显式收紧，否则镜像里的公钥是 0644。
+harden_dev_ssh() { # <目标 rootfs tree>：dev 的 authorized_keys 目录/文件权限收紧
+	_dst=$1
+	[ "${TYPE}" = dev ] || return 0
+	_d=${_dst}/etc/dropbear
+	_f=${_d}/authorized_keys
+	if [ "${DRY_RUN}" = 1 ]; then
+		printf '  chmod 0700 %s\n' "${_d}"
+		printf '  chmod 0600 %s\n' "${_f}"
+		return 0
+	fi
+	[ -f "${_f}" ] || die "dev 注入后缺 ${_f}" \
+		"确认 phase1/dev/rootfs/etc/dropbear/authorized_keys 在仓库里（无公钥的 dev 镜像刷到无外设设备上等于拔盘重写）"
+	chmod 0700 "${_d}" || die "chmod 0700 ${_d} 失败" "确认 rootfs tree 可写"
+	chmod 0600 "${_f}" || die "chmod 0600 ${_f} 失败" "确认 rootfs tree 可写"
+	printf '  dev 调试公钥 /etc/dropbear/authorized_keys（目录 0700 / 文件 0600）\n'
+}
+
 assert_prod_clean() { # <rootfs tree>：prod 里不许出现任何 dev 痕迹
 	_dst=$1
 	[ "${TYPE}" = prod ] || return 0
@@ -588,6 +609,10 @@ assert_prod_clean() { # <rootfs tree>：prod 里不许出现任何 dev 痕迹
 		[ ! -e "${_dst}/${_f}" ] || die "prod 镜像里出现了 dev 专有文件: ${_f}" \
 			"检查 phase1/firstboot/rootfs 有没有误放 dev 内容"
 	done
+	# 认证材料：prod 不得带任何公钥（公钥只允许出现在 phase1/dev/rootfs，仅 --type dev 注入）
+	[ ! -e "${_dst}/etc/dropbear/authorized_keys" ] || die \
+		"prod 镜像里出现了 SSH 公钥: etc/dropbear/authorized_keys" \
+		"prod 不得带任何认证材料；把公钥放回 phase1/dev/rootfs（只在 --type dev 时注入）"
 	_hit=$(grep -rl 'dev-open-wan' "${_dst}" 2>/dev/null | sed "s#^${_dst}##" | head -3 | tr '\n' ' ')
 	[ -z "${_hit}" ] || die "prod 镜像里出现了 dev-open-wan 规则: ${_hit}" \
 		"确认 build.sh 的 inject_dev_firewall 只在 --type dev 下执行"
@@ -599,6 +624,7 @@ prepare_and_inject() { # <目标 rootfs tree>：解包 + 注入 + dev 规则；�
 	inject_tree "${FB_TREE}" "${_dst}" firstboot
 	if [ "${TYPE}" = dev ]; then
 		inject_tree "${DEV_TREE}" "${_dst}" dev
+		harden_dev_ssh "${_dst}"
 	fi
 	check_inject_conflict
 	inject_dev_firewall "${_dst}"

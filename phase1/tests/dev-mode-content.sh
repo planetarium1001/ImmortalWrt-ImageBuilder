@@ -167,6 +167,19 @@ eq "dev 有 firstboot 的 10-grow-p2.sh" 'yes' "$([ -f "$GROW" ] && echo yes || 
 eq "10-grow-p2.sh 可执行" '-rwxr-xr-x' "$(ls -l "$GROW" 2>/dev/null | cut -c1-10)"
 if sh -n "$GROW" 2>/dev/null; then ok "10-grow-p2.sh sh -n 通过"; else bad "10-grow-p2.sh 语法错误"; fi
 
+echo "-- dev 的调试公钥（无外设设备唯一的登录通道）--"
+DEV_AK=$DEV/etc/dropbear/authorized_keys
+REPO_AK=$REPO/phase1/dev/rootfs/etc/dropbear/authorized_keys
+eq "dev 有 /etc/dropbear/authorized_keys" 'yes' "$([ -f "$DEV_AK" ] && echo yes || echo no)"
+eq "/etc/dropbear 目录权限 0700" 'drwx------' "$(ls -ld "$DEV/etc/dropbear" 2>/dev/null | cut -c1-10)"
+eq "authorized_keys 权限 0600（检出是 0644，构建期 chmod）" '-rw-------' \
+	"$(ls -l "$DEV_AK" 2>/dev/null | cut -c1-10)"
+eq "authorized_keys 与仓库公钥逐字节一致" 'same' \
+	"$(cmp -s "$DEV_AK" "$REPO_AK" && echo same || echo differ)"
+contains "authorized_keys 含项目专用公钥" 'n5105-dev-debug' "$(cat "$DEV_AK" 2>/dev/null)"
+eq "authorized_keys 只有一行（不多塞密钥）" '1' "$(awk 'END {print NR}' "$DEV_AK" 2>/dev/null)"
+contains "构建日志打印了 dev 调试公钥" 'dev 调试公钥' "$(cat "$SB_ROOT/dev.log")"
+
 eq "原有 etc/config/system 还在" 'yes' "$([ -f "$DEV/etc/config/system" ] && echo yes || echo no)"
 eq "原有 etc/config/system 内容未被改" 'same' "$(cmp -s "$FIX/etc/config/system" "$DEV/etc/config/system" && echo same || echo differ)"
 eq "原有 etc/uci-defaults/50-fixture-defaults 还在" 'yes' \
@@ -184,6 +197,22 @@ eq "prod prepare 退出 0" '0' "$RC"
 PROD=$SB_ROOT/prod
 eq "prod 没有 etc/DEV-IMAGE" 'no' "$([ -e "$PROD/etc/DEV-IMAGE" ] && echo yes || echo no)"
 eq "prod 没有 90-dev-image" 'no' "$([ -e "$PROD/etc/uci-defaults/90-dev-image" ] && echo yes || echo no)"
+eq "prod 没有 etc/dropbear/authorized_keys（不得带认证材料）" 'no' \
+	"$([ -e "$PROD/etc/dropbear/authorized_keys" ] && echo yes || echo no)"
+eq "prod 全树没有项目公钥字样" '' \
+	"$(grep -rl 'n5105-dev-debug' "$PROD" 2>/dev/null | sed "s#^$PROD##" | tr '\n' ' ')"
+
+echo "-- prod 守卫：rootfs 自带公钥必须硬失败（不是静默通过）--"
+FIX_AK=$SB_ROOT/fixture-with-key
+mkdir -p "$FIX_AK"
+cp -a "$FIX/." "$FIX_AK/"
+mkdir -p "$FIX_AK/etc/dropbear"
+cp "$REPO_AK" "$FIX_AK/etc/dropbear/authorized_keys"
+run_build "$SB_ROOT/prod-key.log" --type prod --prepare-rootfs "$SB_ROOT/prod-key" \
+	--rootfs "$FIX_AK" --kernel "$KERNEL" --image-out /dev/null --size 8G
+ne "prod 守卫：rootfs 自带公钥 ⇒ 非 0" '0' "$RC"
+contains "prod 守卫点名 authorized_keys" 'authorized_keys' "$(cat "$SB_ROOT/prod-key.log")"
+contains "prod 守卫提示不得带认证材料" '认证材料' "$(cat "$SB_ROOT/prod-key.log")"
 eq "prod 全树没有 dev-open-wan 字样" '' "$(grep -rl 'dev-open-wan' "$PROD" 2>/dev/null | sed "s#^$PROD##" | tr '\n' ' ')"
 eq "prod 全树没有 dev_open_wan 字样" '' "$(grep -rl 'dev_open_wan' "$PROD" 2>/dev/null | sed "s#^$PROD##" | tr '\n' ' ')"
 eq "prod 的 firewall 与出厂内容逐字节一致（没被 append）" 'same' \
@@ -385,6 +414,8 @@ eq "真跑把 dev 的 firewall 规则写进 work/rootfs" 'yes' \
 	"$(grep -q "option name 'dev-open-wan'" "$WORK/rootfs/etc/config/firewall" && echo yes || echo no)"
 eq "真跑把 firstboot 注入落到 work/rootfs" 'yes' \
 	"$([ -f "$WORK/rootfs/etc/uci-defaults/10-grow-p2.sh" ] && echo yes || echo no)"
+eq "真跑把 dev 的调试公钥落到 work/rootfs（0600）" '-rw-------' \
+	"$(ls -l "$WORK/rootfs/etc/dropbear/authorized_keys" 2>/dev/null | cut -c1-10)"
 eq "真跑组出 STAGE 载荷（btrfs.ko）" 'yes' \
 	"$([ -f "$WORK/stage/lib/modules/$KVER/btrfs.ko" ] && echo yes || echo no)"
 

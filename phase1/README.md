@@ -23,7 +23,7 @@
 | `phase1/tests/fixtures/grub.cfg.device-r38135.provenance` | 上面这个 fixture 的出处（来源路径 / 版本 r38135 / 取回时间 2026-11-06 / md5 / 第 3 条是 spick 遗留项） | 只读说明 |
 | `phase1/make-initramfs.sh`、`phase1/initramfs/init` | initrd 构建与 `/init` 引导链（teammate tm-02 的产出，本目录只读参考） | 见各自文件 |
 | `phase1/build.sh` | **CI 单一入口**：解包 rootfs → 注入 firstboot(+dev) → 组 initrd 的 STAGE → `make-initramfs.sh` → `assemble-image.sh --image` → `gzip -9` + sha256 | 已实现；离线用 `--prepare-rootfs` / `--dry-run` 验 |
-| `phase1/dev/rootfs/**` | **仅 dev 镜像**注入：`etc/DEV-IMAGE`（模板 `.in`）+ `etc/uci-defaults/90-dev-image`（首启写 `dev-open-wan` 全放行 + hostname `-dev`） | 已实现；`phase1/tests/dev-mode-content.sh` 断言 |
+| `phase1/dev/rootfs/**` | **仅 dev 镜像**注入：`etc/DEV-IMAGE`（模板 `.in`）+ `etc/uci-defaults/90-dev-image`（首启写 `dev-open-wan` 全放行 + hostname `-dev`）+ `etc/dropbear/authorized_keys`（调试公钥，构建期 chmod 0700/0600） | 已实现；`phase1/tests/dev-mode-content.sh` 断言 |
 | `phase1/firstboot/rootfs/etc/uci-defaults/10-grow-p2.sh` | **两种类型都注入**：首启把 p2 扩到盘尾（幂等，失败不阻断启动） | 已实现；`phase1/tests/firstboot-grow.sh` 用桩断言 |
 | `phase1/tests/assemble-image-mode.sh` | ac-1：`--image` 参数校验 / dry-run 计划 / 失败也拆 loop / Linux 真跑（`PHASE1_IMAGE_REAL=1`） | `sh phase1/tests/assemble-image-mode.sh` |
 | `phase1/tests/dev-mode-content.sh` | ac-4：dev vs prod 的注入差异（真跑 `--prepare-rootfs` 后比对） | `sh phase1/tests/dev-mode-content.sh` |
@@ -264,6 +264,7 @@ sh phase1/build.sh --type dev --rootfs /path/rootfs --kernel vmlinuz \
 | `/etc/config/firewall` 的 `dev-open-wan` 规则（`src=wan, proto=all, target=ACCEPT`） | 首启由 `/etc/uci-defaults/90-dev-image` 写入（幂等） | 不写；镜像里没有这个脚本 |
 | hostname 后缀 `-dev` | 同上脚本追加（幂等） | 无 |
 | `/etc/DEV-IMAGE` 标记（含 type/built_at/git_sha） | 有（构建期从 `DEV-IMAGE.in` 渲染） | 无 |
+| `/etc/dropbear/authorized_keys`（调试公钥；目录 0700、文件 0600） | 有（`phase1/dev/rootfs` 注入，构建期 `chmod`） | **无**——`assert_prod_clean` 见到就硬失败 |
 | `/etc/uci-defaults/10-grow-p2.sh`（首启扩容） | 有 | 有 |
 
 STAGE（initrd 载荷）**缺任何一项就失败并点名到包**（`kmod-fs-btrfs`/`kmod-fs-vfat`/`kmod-nls-*`/`attr`/`libgcc`/`libubox`），
@@ -279,6 +280,13 @@ STAGE（initrd 载荷）**缺任何一项就失败并点名到包**（`kmod-fs-b
 - **dev 的 WAN 放行是"镜像里就有"**：`--type dev` 在构建期把 `phase1/dev/rootfs/etc/config/firewall.dev-rule`
   append 进镜像的 `/etc/config/firewall`（判重幂等，末尾没换行会先补）；首启的 `90-dev-image` 保留作兜底，
   它按规则名判重所以不会叠第二条。**
+- **dev 的调试公钥（无外设设备唯一的登录通道）**：`--type dev` 把 `phase1/dev/rootfs/etc/dropbear/authorized_keys`
+  注入镜像，并在构建期 `chmod 0700 /etc/dropbear` + `chmod 0600 authorized_keys`——
+  git 只记录 644/755，检出到工作区/CI 的都是 0644，不显式收紧的话镜像里就是 0644。
+  路径依据：OpenWrt 给 dropbear 打了 `100-pubkey_path.patch`，root（uid 0）读 `/etc/dropbear/authorized_keys`
+  且只校验**目录**不可被 group/other 写（见 `.workflow/knowledge/fact/active/2026-11-07-openwrt-dropbear-root-etc-dropbear-autho.md`）。
+  **prod 镜像不得带任何公钥**：`assert_prod_clean` 见到 `etc/dropbear/authorized_keys` 直接 `die`。
+  私钥只在 `.workflow/assets/router-ssh/`（该目录被 `.gitignore` 整体忽略，不进版本库）。
 
 ### 5.7 首启扩容的失败语义（`10-grow-p2.sh`）
 
