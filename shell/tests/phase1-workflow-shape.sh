@@ -221,6 +221,18 @@ block_has "挂 build25.sh → build.sh" "$BLOCK_IB" "build25.sh:/home/build/immo
 block_has "custom_router_ip 走单文件挂载" "$BLOCK_IB" \
 	"custom_router_ip.txt:/home/build/immortalwrt/files/etc/config/custom_router_ip.txt"
 block_has "给基线 build25.sh 的 \$PROFILE 提供取值（否则 ROOTFS_PARTSIZE 为空）" "$BLOCK_IB" "-e PROFILE=1024"
+# 结构护栏：`\` 续行之间不许出现注释行。写在续行里会被 bash 当成整条命令的行内注释，
+# 把后面的参数连同镜像名一起吞掉（首跑实测：docker run 报 "requires at least 1 argument"）。
+_bad_cont=$(awk '
+	prev ~ /\\$/ && $0 ~ /^[[:space:]]*#/ { printf "%d:%s\n", NR, $0 }
+	{ prev = $0 }
+' "$WF")
+if [ -z "$_bad_cont" ]; then
+	ok "续行之间没有夹注释（否则 bash 会把整条命令的剩余部分当注释吞掉）"
+else
+	bad "续行之间夹了注释：$_bad_cont"
+fi
+
 block_has "PROFILE 必须 > 512：rootfs 未压缩 564MB，512 会让 root.ext4 分配失败（首跑实测）" "$BLOCK_IB" "-e PROFILE=1024"
 block_has "容器跑在 pipefail 下（退出码不被 tee 吞掉）" "$BLOCK_IB" "set -euo pipefail"
 block_has "docker 输出落 build.sh.log（失败时可上传）" "$BLOCK_IB" 'tee "$WORK/build.sh.log"'

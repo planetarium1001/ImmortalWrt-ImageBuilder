@@ -128,6 +128,16 @@ jobs:
           echo "${{ inputs.custom_router_ip }}" > "$BASE/custom/custom_router_ip.txt"
           echo "router ip: ${{ inputs.custom_router_ip }}"
 
+          # ROOTFS_PARTSIZE：基线 build25.sh 写的是 ROOTFS_PARTSIZE=$PROFILE，而 fe53232 基线从未给它赋值。
+          # 首跑实测 512MB 会让 make image 在 root.ext4 阶段炸掉
+          # （ext4_allocate_best_fit_partial: failed to allocate 13199 blocks, out of space?）：
+          # rootfs 未压缩内容 = 577423 KB ≈ 564MB > 512MB。我们只取它产出的 rootfs 树与内核，
+          # 镜像自身分区尺寸与此无关 ⇒ 给 1024 留足余量。
+          #
+          # 注意：这些注释必须留在 docker run 的**续行之外**。写在 \ 续行之间会被 bash 当成
+          # 整条命令的行内注释，把后面的 -e 与镜像名一起吞掉（首跑就是这么炸的：
+          # 'docker run' requires at least 1 argument）。
+          #
           # 失败即 job 失败：set -o pipefail 让 docker 的非 0 退出码穿过 tee 透传出来
           docker run --rm -i \
             --user root \
@@ -138,11 +148,6 @@ jobs:
             -v "$BASE/shell:/home/build/immortalwrt/shell" \
             -v "$BASE/x86-64/build25.sh:/home/build/immortalwrt/build.sh" \
             -e INCLUDE_DOCKER="$include_docker" \
-            # ROOTFS_PARTSIZE：基线 build25.sh 写的是 ROOTFS_PARTSIZE=$PROFILE，而 fe53232 基线从未给它赋值。
-            # 首跑实测：512MB 时 make image 在 root.ext4 阶段炸掉
-            # （ext4_allocate_best_fit_partial: failed to allocate 13199 blocks, out of space?），
-            # 因为 rootfs 未压缩内容 = 577423 KB ≈ 564MB > 512MB。
-            # 我们只取它产出的 rootfs 树与内核，镜像自身分区尺寸与此无关 ⇒ 给 1024 留足余量。
             -e PROFILE=1024 \
             "immortalwrt/imagebuilder:x86-64-openwrt-${luci_version}" /bin/bash /home/build/immortalwrt/build.sh \
             2>&1 | tee "$WORK/build.sh.log"
