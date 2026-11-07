@@ -88,9 +88,12 @@ contains "点名 bs-1 缺文件" 'FAIL bs-1' "$OUT"
 echo "== 6. 失败时必须把现场打到 stdout（否则红了排不了障）=="
 OUT=$(sh "$S" --replay "$SB_ROOT/serial.nokernel" --boot-log "$SB_ROOT/boot.ok" 2>&1)
 case "$OUT" in
-*串口日志尾部*) ok "打印了串口日志尾部（红了能排障）" ;;
-*) bad "失败时没打印串口日志尾部" ;;
+*'串口日志（'*|*串口日志尾部*) ok "打印了串口日志（红了能排障）" ;;
+*) bad "失败时没打印串口日志" ;;
 esac
+# --replay 模式没有 qemu 进程，自然没有 qemu 内部日志；这条只能静态断言"真跑路径会开 -d"
+grep -q -- '-d guest_errors,int' "$S" && ok "真跑路径开了 qemu 内部日志（-d guest_errors,int）" ||
+	bad "真跑路径没开 qemu 内部日志（失败时看不出三重复位这类问题）"
 case "$OUT" in
 *p1\ 引导日志尾部*|*p1引导日志尾部*) ok "打印了 p1 引导日志尾部" ;;
 *) bad "失败时没打印 p1 引导日志尾部" ;;

@@ -88,6 +88,7 @@ cleanup() {
 		[ -f "${WORK}/serial.log" ] && cp "${WORK}/serial.log" "${LOG_OUT}/serial-${FIRMWARE}.log" 2>/dev/null || true
 		[ -f "${WORK}/qemu.out" ] && cp "${WORK}/qemu.out" "${LOG_OUT}/qemu-${FIRMWARE}.out" 2>/dev/null || true
 		[ -f "${WORK}/phase1-boot.log" ] && cp "${WORK}/phase1-boot.log" "${LOG_OUT}/phase1-boot-${FIRMWARE}.log" 2>/dev/null || true
+		[ -f "${WORK}/qemu-debug.log" ] && cp "${WORK}/qemu-debug.log" "${LOG_OUT}/qemu-debug-${FIRMWARE}.log" 2>/dev/null || true
 	fi
 	if [ -n "${WORK}" ] && [ -d "${WORK}" ] && [ "$KEEP" = 0 ]; then rm -rf "${WORK}"; fi
 	return 0
@@ -153,9 +154,14 @@ judge() {
 	fi
 	printf 'BOOT-SMOKE FAILED（%d 项检查）\n' "$NCHECK"
 	# 红了必须能排障：默认 cleanup 会删临时目录，这里先把现场尾巴打出来
-	if [ -f "$SERIAL_LOG" ]; then printf '\n-- 串口日志尾部 --\n'; tail -30 "$SERIAL_LOG" 2>/dev/null; fi
+	if [ -f "$SERIAL_LOG" ]; then
+		_n=$(wc -l <"$SERIAL_LOG" 2>/dev/null | tr -d ' ')
+		printf '\n-- 串口日志（%s 行）--\n' "${_n:-0}"
+		if [ "${_n:-0}" -le 60 ] 2>/dev/null; then cat "$SERIAL_LOG" 2>/dev/null; else tail -40 "$SERIAL_LOG" 2>/dev/null; fi
+	fi
 	if [ -f "$BOOT_LOG" ]; then printf '\n-- p1 引导日志尾部 --\n'; tail -30 "$BOOT_LOG" 2>/dev/null; fi
 	if [ -n "${WORK}" ] && [ -f "${WORK}/qemu.out" ]; then printf '\n-- qemu 输出尾部 --\n'; tail -20 "${WORK}/qemu.out" 2>/dev/null; fi
+	if [ -n "${WORK}" ] && [ -f "${WORK}/qemu-debug.log" ]; then printf '\n-- qemu 内部日志尾部（-d guest_errors,int）--\n'; tail -25 "${WORK}/qemu-debug.log" 2>/dev/null; fi
 	return 1
 }
 
@@ -195,8 +201,14 @@ GROW_LOG=$WORK/phase1-grow.log
 
 # 用 NVMe 控制器起盘：initrd 里烘焙的默认设备是 /dev/nvme0n1p2，换 virtio 会让"设备名不匹配"的
 # 缺陷在冒烟里被掩盖（真机是 NVMe）。
+# -boot order=c：显式指定从硬盘起（不同固件默认值不一样，别靠默认）。
+# bootindex=0：把这块盘放进固件启动候选（NVMe 上尤其重要）。
+# -d guest_errors,int + -D：三重复位/非法指令这类"根本没跑到引导器"的情况只有 QEMU 自己看得到。
 set -- -m 2048 -display none -serial "file:$SERIAL_LOG" -no-reboot \
-	-drive "file=$IMAGE,format=raw,if=none,id=d0" -device "nvme,serial=phase1smoke,drive=d0"
+	-boot order=c,menu=off \
+	-d guest_errors,int -D "$WORK/qemu-debug.log" \
+	-drive "file=$IMAGE,format=raw,if=none,id=d0,bootindex=0" \
+	-device "nvme,serial=phase1smoke,drive=d0,bootindex=0"
 if [ "$FIRMWARE" = 'uefi' ]; then
 	set -- "$@" -bios "$OVMF"
 fi

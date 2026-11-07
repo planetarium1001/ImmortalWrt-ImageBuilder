@@ -416,6 +416,19 @@ if mount -o ro "${LOOP}p1" "$MNT_P1" 2>/dev/null; then
 		else
 			fail "BOOTX64.EFI 不是 PE 可执行文件（magic=${_magic}）"
 		fi
+		# prefix 自洽：--removable 的 EFI 引导器只认 /EFI/BOOT 下的 grub.cfg 与 x86_64-efi/*.mod。
+		# 只放 BOOTX64.EFI 而把 cfg/模块留在 boot/grub 时，引导器读不到配置 ⇒ 屏幕与串口都不会有输出，
+		# 症状与"没引导"完全一样（2026-11-07 CI 冒烟实测踩到）。
+		if [ -f "$MNT_P1/EFI/BOOT/grub.cfg" ]; then
+			pass "EFI/BOOT/grub.cfg 存在（prefix=/EFI/BOOT 才能读到配置）"
+		else
+			fail "EFI/BOOT/grub.cfg 缺失（EFI 引导器会读不到配置，静默无输出）"
+		fi
+		if [ -d "$MNT_P1/EFI/BOOT/x86_64-efi" ]; then
+			pass "EFI/BOOT/x86_64-efi 模块树存在"
+		else
+			fail "EFI/BOOT/x86_64-efi 缺失（EFI 引导器加载模块会失败）"
+		fi
 	else
 		fail "p1 缺 EFI/BOOT/BOOTX64.EFI（纯 UEFI 固件将无法引导，会落到 UEFI Shell）"
 	fi

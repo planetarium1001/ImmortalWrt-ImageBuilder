@@ -1253,7 +1253,26 @@ install_grub_efi() { # <目标盘（仅日志用）>
 	if [ "$_efi_magic" != "4d5a" ]; then
 		fail "BOOTX64.EFI 不是 PE 可执行文件（magic=${_efi_magic}，应为 4d5a=MZ）" "确认装的是 x86_64-efi 而不是 arm64-efi"
 	fi
-	say "  EFI 引导器: $BOOT_MNT/EFI/BOOT/BOOTX64.EFI（$(wc -c <"$BOOT_MNT/EFI/BOOT/BOOTX64.EFI" | tr -d ' ') 字节）"
+	# `--removable` 把引导器的 prefix 写死成 /EFI/BOOT：它只在那下面找 grub.cfg 与 <platform>/*.mod。
+	# 而 --boot-directory 指到 p1 的 boot/ 时，模块被装到 boot/grub/x86_64-efi ⇒ EFI 侧找不到，
+	# 连 grub.cfg 都读不到 ⇒ 屏幕/串口一句不出、看起来像"没引导"（2026-11-07 CI 冒烟实测）。
+	# 所以在 EFI/BOOT 下放一份模块树，配置由 render_cfg 之后 sync_efi_cfg 复制过去。
+	# 注意：本仓有护栏禁止 assemble-image.sh 里出现**递归删除**（见 phase1/tests/assemble-dry-run.sh），
+	# 所以这里用"合并拷贝"而不是先删后拷：
+	# 目标目录先建好，再把源目录内容 cp -a 进去（幂等，重复构建不会嵌套出 x86_64-efi/x86_64-efi）。
+	mkdir -p "$BOOT_MNT/EFI/BOOT/x86_64-efi" || fail "无法创建 $BOOT_MNT/EFI/BOOT/x86_64-efi" "确认 p1 可写"
+	cp -a "$BOOT_MNT$(boot_prefix)/grub/x86_64-efi/." "$BOOT_MNT/EFI/BOOT/x86_64-efi/" ||
+		fail "复制 x86_64-efi 模块到 EFI/BOOT 失败" "确认 --boot-directory 下有 grub/x86_64-efi（grub-efi-amd64-bin 装了吗）"
+	[ -d "$BOOT_MNT/EFI/BOOT/x86_64-efi" ] ||
+		fail "EFI/BOOT/x86_64-efi 缺失" "prefix=/EFI/BOOT 的引导器会找不到模块"
+	say "  EFI 引导器: $BOOT_MNT/EFI/BOOT/BOOTX64.EFI（$(wc -c <"$BOOT_MNT/EFI/BOOT/BOOTX64.EFI" | tr -d ' ') 字节）+ 模块树 $(boot_prefix)/grub/x86_64-efi → EFI/BOOT/x86_64-efi"
+}
+
+# 渲染完 grub.cfg 后同步一份到 EFI/BOOT（prefix=/EFI/BOOT 的引导器读的是这一份）。
+sync_efi_cfg() { # <已渲染的 grub.cfg>
+	[ -d "$BOOT_MNT/EFI/BOOT" ] || return 0
+	cp "$1" "$BOOT_MNT/EFI/BOOT/grub.cfg" || fail "同步 grub.cfg 到 EFI/BOOT 失败" "确认 p1 可写"
+	say "  EFI 配置: EFI/BOOT/grub.cfg（与 $(boot_prefix)/grub/grub.cfg 同一份内容）"
 }
 
 # --- 唯一的破坏性入口：所有写盘动作都在这个函数里 ---
@@ -1315,6 +1334,7 @@ destructive_install() {
 	install_grub "$KERNEL" "$INITRD"
 	mkdir -p "$_grubdir" || fail "无法创建 $_grubdir" "确认 p1 已挂载"
 	render_cfg "$_grubdir" || fail "渲染 grub.cfg 失败" "检查 --cmdline 是否满足硬规则"
+	sync_efi_cfg "$_grubdir/grub.cfg"
 	# 最终镜像**不**创建试跑标记：0 号项就是唯一入口
 	sync
 	umount "$BOOT_MNT" || warn "卸载 $BOOT_MNT 失败（重启前请手工 umount）"
@@ -1563,6 +1583,7 @@ image_write() {
 	_grubdir=$BOOT_MNT$(boot_prefix)/grub
 	mkdir -p "$_grubdir" || fail "无法创建 $_grubdir" "确认 p1 已挂载"
 	render_cfg "$_grubdir" || fail "渲染 grub.cfg 失败" "检查 --cmdline 是否满足硬规则"
+	sync_efi_cfg "$_grubdir/grub.cfg"
 	# 最终镜像**不**创建试跑标记：0 号项就是唯一入口
 	sync
 	umount "$BOOT_MNT" || fail "卸载镜像 p1 失败: $BOOT_MNT" "确认没有进程占着 $BOOT_MNT"

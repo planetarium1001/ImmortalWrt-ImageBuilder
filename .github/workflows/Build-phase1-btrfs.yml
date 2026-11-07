@@ -462,11 +462,19 @@ jobs:
               tail -40 "$WORK/boot-smoke-${mode}-${fw}.txt"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            [ "$rc" = 0 ] || rc_all=$rc
+            # 2026-11-07 用户裁定：交付面只承诺 UEFI（N5105 实测是纯 UEFI，无 CSM），
+            # 所以 **UEFI 档失败即红**，BIOS 档暂记告警（跑通并稳定后再升级为阻塞）。
+            if [ "$rc" != 0 ]; then
+              if [ "$fw" = uefi ]; then
+                rc_all=$rc
+              else
+                echo "::warning::BIOS 冒烟未通过（暂不阻塞；见 PRD ac-4 与 quality.md 的已知边界）"
+              fi
+            fi
           done
           rm -f "$IMG" "$IMG.pristine"
           if [ "$rc_all" != 0 ]; then
-            echo "::error::冷启动冒烟失败（镜像在 qemu 里起不来，别拿去刷真机）"
+            echo "::error::UEFI 冷启动冒烟失败（镜像在 qemu 里起不来，别拿去刷真机）"
             exit 1
           fi
 

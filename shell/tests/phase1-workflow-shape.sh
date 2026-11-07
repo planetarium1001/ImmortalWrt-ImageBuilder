@@ -351,6 +351,8 @@ block_has "调用 qemu-boot-check.sh" "$BLOCK_BOOT" "qemu-boot-check.sh"
 block_has "跑 UEFI 档" "$BLOCK_BOOT" "for fw in uefi bios"
 block_has "带超时 BOOT_TIMEOUT" "$BLOCK_BOOT" "BOOT_TIMEOUT"
 block_has "失败要 exit 1（不许吞）" "$BLOCK_BOOT" "exit 1"
+block_has "UEFI 档失败即红（把 rc 记为 rc_all）" "$BLOCK_BOOT" 'rc_all=$rc'
+block_has "BIOS 档暂记告警（::warning::）" "$BLOCK_BOOT" "::warning::"
 block_has "报告落盘为 boot-smoke-*.txt" "$BLOCK_BOOT" "boot-smoke-"
 block_has "两种固件各用一份干净镜像（避免旧日志冒充）" "$BLOCK_BOOT" "cp --reflink=auto"
 block_has "失败要保留现场（--log-out 归档串口/qemu 日志）" "$BLOCK_BOOT" "--log-out"
