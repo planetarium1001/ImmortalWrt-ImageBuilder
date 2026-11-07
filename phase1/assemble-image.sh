@@ -1182,18 +1182,28 @@ install_grub() { # <内核文件> <initrd 文件> [目标设备，默认 $DISK] 
 
 	# Phase 1：这里就是唯一一次写 core.img（装到 p128 EF02）。后续只在模块集合变化时
 	# 才需要重建，那是 Phase 3 的事（见 decisions §0.1 的 p128 说明）。
-	# 真装机：--recheck（重新探测设备映射，盘可能刚分区）。
-	# 镜像模式：--no-floppy 且不 --recheck（目标是一个 loop，--recheck 只会多探一遍宿主设备，
-	# 在 CI 上既慢又容易因为"找不到设备映射"误报）；这条差异由调用方用第 4 个参数传进来。
-	_recheck='--recheck'
-	case " $_extra " in
-	*' --no-recheck '*) _recheck='' ;;
-	esac
-	say "  \$ grub-install --target=i386-pc --boot-directory=$_bootdir --modules=\"$GRUB_MODULES\" $_extra ${_recheck:+$_recheck }$_target"
+	# 真装机：带 --recheck（重新探测设备映射，盘可能刚分区）。
+	# 镜像模式：只带 --no-floppy、**不带** --recheck（目标是一个 loop；--recheck 会去探宿主设备，
+	# 在 CI 上既慢又可能因"找不到设备映射"误报）。
+	# `--no-recheck` 只是调用方的**内部标记**，不是 grub-install 的选项（grub-install 没有它，
+	# 首跑实测：unrecognized option '--no-recheck'），所以这里要把它从真正下发的参数里滤掉。
+	_skip_recheck=0
+	_ghflags=''
+	for _a in $_extra; do
+		case $_a in
+		--no-recheck) _skip_recheck=1 ;;
+		*) _ghflags="${_ghflags}${_ghflags:+ }${_a}" ;;
+		esac
+	done
+	if [ "$_skip_recheck" = 0 ]; then
+		_ghflags="${_ghflags}${_ghflags:+ }--recheck"
+	fi
+	say "  \$ grub-install --target=i386-pc --boot-directory=$_bootdir --modules=\"$GRUB_MODULES\" ${_ghflags} $_target"
+	# shellcheck disable=SC2086
 	grub-install --target=i386-pc \
 		--boot-directory="$_bootdir" \
 		--modules="$GRUB_MODULES" \
-		$_extra ${_recheck:+"$_recheck"} "$_target" ||
+		$_ghflags "$_target" ||
 		fail "grub-install 失败" "确认 p128 EF02 分区存在（sgdisk -p $_target 的第 128 号）"
 }
 

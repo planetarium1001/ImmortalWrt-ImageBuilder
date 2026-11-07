@@ -142,6 +142,15 @@ contains "TERM/HUP 走 143" "trap 'image_teardown 143' TERM HUP" "$SRC"
 contains "teardown 里 rc=0 时强制非 0" '_rc=1' "$SRC"
 contains "覆盖已有文件要 --force-overwrite" '--force-overwrite' "$SRC"
 contains "挂载点被占用时硬失败" '已被占用（并发构建或上次失败的残留）' "$SRC"
+# grub-install 没有 --no-recheck 这个选项（首跑实测 unrecognized option）；它只是内部标记，
+# 必须被过滤掉、只把 --no-floppy 真正下发。
+contains "内部标记 --no-recheck 会被过滤" '--no-recheck) _skip_recheck=1' "$SRC"
+contains "下发的是 _ghflags（不是原始 \$4）" 'grub-install --target=i386-pc \' "$SRC"
+if printf '%s\n' "$SRC" | grep -qE '^\s*\$_extra '; then
+	bad "grub-install 仍然直接下发 \$4（会带上 --no-recheck）"
+else
+	ok "grub-install 不再直接下发 \$4"
+fi
 contains "镜像模式拒绝 /dev 输出" '必须是普通文件路径' "$SRC"
 contains "镜像模式检查是否 root" '镜像模式需要 root' "$SRC"
 contains "镜像模式要求 Linux" 'losetup' "$SRC"

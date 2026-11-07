@@ -833,27 +833,26 @@ build_stage() {
 	stage_optional "lib/modules/${KVER}/modules.builtin.modinfo" "lib/modules/${KVER}/modules.builtin.modinfo"
 	stage_take attr usr/bin/getfattr usr/bin/getfattr
 	stage_take attr usr/bin/setfattr usr/bin/setfattr
-	# libattr 可有可无（make-initramfs.sh 只在有它时才带上）：缺了不算错
+	# libattr：getfattr/setfattr 动态链接 libattr.so.1。
+	# 只拷 "第一个 libattr.so*" 是不够的：rootfs 里常见的是 `libattr.so -> libattr.so.1 -> libattr.so.1.1.0`
+	# 这种链，只带上 .so 会让 initrd 里的 getfattr 起不来（make-initramfs 的 ELF 闭包检查会 WARN
+	# "unresolved ./usr/bin/getfattr:libattr.so.1"）。所以按**全部** libattr.so* 逐个进 STAGE。
+	# 仍然"可有可无"：rootfs 里一个都没有时不算错（静态链接的 attr 也合法）。
 	if [ "${DRY_RUN}" = 0 ]; then
-		_la=''
+		_la_n=0
 		for _d in usr/lib lib; do
 			for _f in "${ROOTFS_TREE}/${_d}"/libattr.so*; do
 				if [ -e "${_f}" ] || [ -L "${_f}" ]; then
-					_la=$_f
-					break
+					stage_copy "${_f}" "usr/lib/${_f##*/}"
+					_la_n=$((_la_n + 1))
 				fi
 			done
-			if [ -n "${_la}" ]; then
-				break
-			fi
 		done
-		if [ -n "${_la}" ]; then
-			stage_copy "${_la}" "usr/lib/${_la##*/}"
-		else
-			printf '  STAGE usr/lib/libattr*：rootfs 里没有（attr 是静态链接时可忽略）\n'
+		if [ "${_la_n}" = 0 ]; then
+			printf '  STAGE usr/lib/libattr*：rootfs 里没有（attr 静态链接时可忽略）\n'
 		fi
 	else
-		stage_plan attr 'usr/lib/libattr*' "${ROOTFS_TREE}/usr/lib/libattr.so.*"
+		stage_plan attr 'usr/lib/libattr.so*（全部版本，getfattr 的 soname 依赖）' "${ROOTFS_TREE}/usr/lib/libattr.so.*"
 	fi
 	if [ "${DRY_RUN}" = 0 ]; then
 		if [ -n "${MISSING}" ]; then
