@@ -399,7 +399,10 @@ jobs:
           # （rootfs 源树 ~564MB、ImageBuilder 的 bin/targets 产物、base 里的 files 拷贝）。
           # 自检自己只用仓库工作树里的 files/lib/preinit/80_mount_root，不依赖这些。
           df -h "$RUNNER_TEMP" || true
-          rm -rf "$WORK/rootfs" "$RUNNER_TEMP/phase1-base/bin" "$RUNNER_TEMP/phase1-base/files"
+          # $BASE/bin 里的产物是容器内 root 建的（docker run --user root），普通用户删不掉
+          # （首跑实测 rm: Permission denied ⇒ set -e 直接失败）。这里必须 sudo；
+          # 删不干净也不算致命，剩下的空间够 8G 解压就继续。
+          sudo rm -rf "$WORK/rootfs" "$RUNNER_TEMP/phase1-base/bin" "$RUNNER_TEMP/phase1-base/files" || true
           df -h "$RUNNER_TEMP" || true
 
           set +e
