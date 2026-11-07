@@ -381,10 +381,18 @@ if mount -o ro "${LOOP}p1" "$MNT_P1" 2>/dev/null; then
 				else
 					note "没有给 --init-sha，只打印不比对"
 				fi
-				for _k in phase1_dev phase1_overlay rdinit; do
+				# 判据必须是 /init 文件里**真的有**的东西：
+				#   rdinit= 是 grub 传给内核的参数，不在 /init 文本里（上一版写错过，白挂了一轮 CI）。
+				for _k in phase1_dev phase1_overlay phase1_bootsub; do
 					grep -q "$_k" "$MNT_IR/init" && pass "initrd 内 /init 含 ${_k}" ||
 						fail "initrd 内 /init 缺 ${_k}（可能打包了上游 /init）"
 				done
+				# /init 必须是本仓库模板渲染出来的（占位符已替换、无残留 @KEY@）
+				if grep -qE '@[A-Z][A-Z0-9_]*@' "$MNT_IR/init"; then
+					fail "initrd 内 /init 仍有未替换的占位符"
+				else
+					pass "initrd 内 /init 无残留占位符"
+				fi
 			else
 				fail "initrd 解包后没有 /init"
 			fi
