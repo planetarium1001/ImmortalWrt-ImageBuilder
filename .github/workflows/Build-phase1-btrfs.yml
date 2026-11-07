@@ -103,7 +103,11 @@ jobs:
           # 那份文件一旦非空，x86-64/build25.sh 就会走"第三方商店"分支（git clone wukongdaily/apk
           # + 塞第三方 apk），产物不再是 fe53232 基线。
           # 正确做法是在 build25.sh 的 `make image` 之前直接拼 PACKAGES。
-          sed -i '/^make image/i PACKAGES="$PACKAGES attr kmod-fs-vfat kmod-nls-cp437 kmod-nls-iso8859-1 kmod-nls-utf8"' \
+          # 注入点必须落在 `- Building image with the following packages:` 那一行**之前**：
+          # 基线 build25.sh 先 echo "$PACKAGES" 再 make image，若只插在 make image 之前，
+          # make 拿到的包是对的、但日志里那份 PACKAGES 里看不到（首跑就因为"日志里没有
+          # kmod-nls-utf8"误判失败）。插在 echo 之前，日志与真跑才是同一份。
+          sed -i '/- Building image with the following packages:/i PACKAGES="$PACKAGES attr kmod-fs-vfat kmod-nls-cp437 kmod-nls-iso8859-1 kmod-nls-utf8"' \
             "$BASE/x86-64/build25.sh"
           grep -n 'kmod-nls-utf8' "$BASE/x86-64/build25.sh"
           if grep -q 'kmod-nls-utf8' "$BASE/shell/apk-custom-packages.sh"; then
@@ -351,12 +355,19 @@ jobs:
             exit 1
           fi
           case "$PKGS" in
-          *kmod-nls-utf8*) ;;
+          *kmod-nls-utf8*)
+            echo "ok: 日志里的最终 PACKAGES 含 kmod-nls-utf8（与 make image 收到的是同一份）"
+            ;;
           *)
-            echo "::error::最终 PACKAGES 里没有 kmod-nls-utf8（initrd 依赖没注入）"
+            echo "::error::最终 PACKAGES 里没有 kmod-nls-utf8（initrd 依赖没注入，或注入点落在 echo 之后）"
+            grep -n 'Building image with the following packages' "$BASE/x86-64/build25.sh" || true
             exit 1
             ;;
           esac
+          grep -q 'kmod-nls-utf8' "$BASE/x86-64/build25.sh" || {
+            echo "::error::基线 build25.sh 里没有被 sed 注入 PACKAGES 追加行"
+            exit 1
+          }
           ls -lh "$OUT"
 
       - name: Self-check image

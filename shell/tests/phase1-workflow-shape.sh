@@ -190,7 +190,7 @@ block_has "拒绝 usr/sbin/overlay-setup" "$BLOCK_BASE" "usr/sbin/overlay-setup"
 block_has "legacy 基座出现即 exit 1" "$BLOCK_BASE" "exit 1"
 
 echo "== 5. 包注入：走 build25.sh 的 PACKAGES，不碰 CUSTOM_PACKAGES =="
-block_has "在 make image 之前插入 PACKAGES 追加" "$BLOCK_BASE" "sed -i '/^make image/i PACKAGES=\"\$PACKAGES attr"
+block_has "在 packages echo 之前插入 PACKAGES 追加（否则日志里看不到，会误判没注入）" "$BLOCK_BASE" "sed -i '/- Building image with the following packages:/i PACKAGES=\"\$PACKAGES attr"
 block_has "注入 attr" "$BLOCK_BASE" "attr"
 block_has "注入 kmod-fs-vfat" "$BLOCK_BASE" "kmod-fs-vfat"
 block_has "注入 kmod-nls-cp437" "$BLOCK_BASE" "kmod-nls-cp437"
