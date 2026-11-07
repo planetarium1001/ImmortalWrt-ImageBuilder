@@ -99,6 +99,24 @@ case "$OUT" in
 *) bad "失败时没打印 p1 引导日志尾部" ;;
 esac
 
+echo "== 6b. qemu 参数形状（踩过的坑：bootindex 写到 -drive 上会让 qemu 直接拒绝启动）=="
+# bootindex 是 **device** 属性；写在 -drive（块后端）上时 qemu 报
+#   "Block format 'raw' does not support the option 'bootindex'" 并立刻退出。
+_drive_line=$(grep -n -- '-drive "file=' "$S" | head -1)
+_device_line=$(grep -n -- '-device "nvme' "$S" | head -1)
+case "$_drive_line" in
+*bootindex*) bad "-drive 上出现了 bootindex（qemu 会拒绝启动）" ;;
+*) ok "-drive 上没有 bootindex" ;;
+esac
+case "$_device_line" in
+*bootindex*) ok "-device nvme 上带 bootindex" ;;
+*) bad "-device nvme 上没有 bootindex（NVMe 可能进不了启动候选）" ;;
+esac
+grep -q 'BOOT-SMOKE HARNESS-ERROR' "$S" &&
+	ok "qemu 拒绝启动时给 HARNESS-ERROR（不冒充镜像失败）" ||
+	bad "没区分『qemu 起不来』与『镜像起不来』"
+grep -q "exit 3" "$S" && ok "HARNESS-ERROR 用独立退出码 3" || bad "HARNESS-ERROR 没有独立退出码"
+
 echo "== 7. 真跑模式的参数校验（不真的启动）=="
 sh "$S" >/dev/null 2>&1
 eq "既无 --image 也无 --replay ⇒ 退出 2" 2 "$?"

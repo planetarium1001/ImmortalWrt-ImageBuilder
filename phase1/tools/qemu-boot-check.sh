@@ -207,7 +207,7 @@ GROW_LOG=$WORK/phase1-grow.log
 set -- -m 2048 -display none -serial "file:$SERIAL_LOG" -no-reboot \
 	-boot order=c,menu=off \
 	-d guest_errors,int -D "$WORK/qemu-debug.log" \
-	-drive "file=$IMAGE,format=raw,if=none,id=d0,bootindex=0" \
+	-drive "file=$IMAGE,format=raw,if=none,id=d0" \
 	-device "nvme,serial=phase1smoke,drive=d0,bootindex=0"
 if [ "$FIRMWARE" = 'uefi' ]; then
 	set -- "$@" -bios "$OVMF"
@@ -228,6 +228,15 @@ while [ "$_waited" -lt "$TIMEOUT" ]; do
 done
 kill "$QPID" 2>/dev/null || true
 wait "$QPID" 2>/dev/null || true
+
+# qemu 拒绝启动 = **工具/参数问题，不是镜像问题**。这一条是踩出来的：曾把 bootindex 写到 -drive 上，
+# qemu 立刻退出、串口 0 行，而判据把它报成"引导没走到切根"，代价是一整轮 40 分钟的 CI + 一次误判。
+if grep -qE '^qemu-system-x86_64: ' "$WORK/qemu.out" 2>/dev/null; then
+	printf '\n!! qemu 拒绝启动（参数/环境问题，不是镜像的问题）：\n'
+	cat "$WORK/qemu.out" 2>/dev/null
+	printf '\nBOOT-SMOKE HARNESS-ERROR（先修 qemu 参数，别据此判断镜像）\n'
+	exit 3
+fi
 
 # 从镜像里取出 p1（几何固定：p1 = 扇区 2048 起、524288 扇区）读 /boot/phase1-boot.log
 info "从镜像取 p1 的引导日志"

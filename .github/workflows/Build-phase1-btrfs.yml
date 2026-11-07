@@ -464,7 +464,12 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             # 2026-11-07 用户裁定：交付面只承诺 UEFI（N5105 实测是纯 UEFI，无 CSM），
             # 所以 **UEFI 档失败即红**，BIOS 档暂记告警（跑通并稳定后再升级为阻塞）。
-            if [ "$rc" != 0 ]; then
+            if [ "$rc" = 3 ]; then
+              # 3 = qemu 自己拒绝启动（参数/环境问题）。这不是镜像的问题，报错文案必须区分，
+              # 否则会像 2026-11-07 那次一样把"我把 bootindex 写错位置"误判成"镜像起不来"。
+              echo "::error::冒烟工具错误（qemu 拒绝启动，先修参数/环境；见日志里的 HARNESS-ERROR）"
+              rc_all=$rc
+            elif [ "$rc" != 0 ]; then
               if [ "$fw" = uefi ]; then
                 rc_all=$rc
               else
