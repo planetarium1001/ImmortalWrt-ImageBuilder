@@ -220,7 +220,8 @@ block_has "挂 shell/" "$BLOCK_IB" "shell:/home/build/immortalwrt/shell"
 block_has "挂 build25.sh → build.sh" "$BLOCK_IB" "build25.sh:/home/build/immortalwrt/build.sh"
 block_has "custom_router_ip 走单文件挂载" "$BLOCK_IB" \
 	"custom_router_ip.txt:/home/build/immortalwrt/files/etc/config/custom_router_ip.txt"
-block_has "给基线 build25.sh 的 \$PROFILE 提供取值（否则 ROOTFS_PARTSIZE 为空）" "$BLOCK_IB" "-e PROFILE=512"
+block_has "给基线 build25.sh 的 \$PROFILE 提供取值（否则 ROOTFS_PARTSIZE 为空）" "$BLOCK_IB" "-e PROFILE=1024"
+block_has "PROFILE 必须 > 512：rootfs 未压缩 564MB，512 会让 root.ext4 分配失败（首跑实测）" "$BLOCK_IB" "-e PROFILE=1024"
 block_has "容器跑在 pipefail 下（退出码不被 tee 吞掉）" "$BLOCK_IB" "set -euo pipefail"
 block_has "docker 输出落 build.sh.log（失败时可上传）" "$BLOCK_IB" 'tee "$WORK/build.sh.log"'
 
