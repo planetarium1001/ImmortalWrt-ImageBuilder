@@ -417,5 +417,18 @@ sh phase1/tests/firstboot-grow.sh      # ac-5：首启扩容 6 场景（真跑�
 sh shell/tests/all.sh
 ```
 
+镜像本身只能在 Linux + root 上验（loop 挂载），所以有三段式取证：
+
+```sh
+# 1) CI 里跑（workflow 的 Self-check image 步骤就是它）
+sudo sh phase1/tools/image-selfcheck.sh <out.img.gz> --mode prod --init-sha <build.sh 打印的 INIT_SHA>
+
+# 2) 把 CI 那份 PASS 报告存成本地证据文件后，在任意机器上机械复核（缺项/FAIL 都非 0）
+sh phase1/tools/verify-ci-report.sh selfcheck-prod.txt --mode prod --stage all
+
+# 3) 产物本身的完整性（macOS 也能跑）
+shasum -a 256 -c <out.img.gz>.sha256 && gzip -t <out.img.gz>
+```
+
 两个用例都只用 POSIX sh + 仓库内 `shell/tests/lib-assert.sh`；已在 macOS 的 `/bin/sh`（bash 3.2）与
 `dash`（busybox ash 的近似替代）上跑通，产物只落在 `mktemp -d /tmp/...` 里。
