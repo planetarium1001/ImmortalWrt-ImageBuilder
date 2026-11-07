@@ -40,13 +40,22 @@ IMG=immortalwrt-25.12.2-x86-64-generic-squashfs-combined-efi-n5105.img.gz
 2. **Select target** 只勾 U 盘，逐字核对容量与盘符。
 3. **Flash**，完成后拔插一次。
 
+> ⚠️ **`dd` 前必须解压**。`$IMG` 是 `.img.gz`；直接把 `.gz` 写进盘的话，盘的第一个扇区是 gzip 的
+> `1f 8b`，没有 GPT、没有引导扇区，机器会**完全没有任何反应**（不显示、不进系统、没有日志）。
+> 先 `gunzip -k "$IMG"`（保留原件），下面对 `IMG_PLAIN=*.img` 操作。
+
 ### 方式 B：`dd`（Linux / macOS 命令行）
+
+```sh
+gunzip -k "$IMG"                 # 解压出同名的 .img（-k 保留 .img.gz）
+IMG_PLAIN="${IMG%.gz}"           # 后面 dd 的是解压后的 .img
+```
 
 Linux：
 
 ```sh
 lsblk -o NAME,SIZE,MODEL,TRAN     # 确认 U 盘是 /dev/sdX，别选成 nvme0n1
-sudo dd if="$IMG" of=/dev/sdX bs=4M status=progress oflag=direct conv=fsync
+sudo dd if="$IMG_PLAIN" of=/dev/sdX bs=4M status=progress oflag=direct conv=fsync
 ```
 
 macOS（U 盘是 `/dev/diskN`，原始设备用 `rdiskN` 更快）：
@@ -54,7 +63,7 @@ macOS（U 盘是 `/dev/diskN`，原始设备用 `rdiskN` 更快）：
 ```sh
 diskutil list                              # 记下 U 盘的 diskN
 diskutil unmountDisk /dev/diskN
-sudo dd if="$IMG" of=/dev/rdiskN bs=4m status=progress
+sudo dd if="$IMG_PLAIN" of=/dev/rdiskN bs=4m status=progress
 sync
 diskutil eject /dev/diskN
 ```
@@ -419,6 +428,24 @@ sync
 - `dev` 镜像的 WAN 全放行规则（`dev-open-wan`：`src=wan, proto=all, target=ACCEPT`）**在镜像的
   `/etc/config/firewall` 里就已经存在**（构建期写入；`/etc/uci-defaults/90-dev-image` 只是兜底且按名字判重）。
   `prod` 镜像里全树搜不到 `dev-open-wan`、也没有 `/etc/DEV-IMAGE`。
+
+### B.2.1 引导方式：UEFI 与 legacy **双模**（2026-11-07 实测）
+
+镜像里同时装了两套引导器，因此 N5105 的 BIOS 设成 UEFI 或 Legacy/CSM 都能起来：
+
+| 固件模式 | 走哪条路 | 盘上的东西 |
+|---|---|---|
+| UEFI（无 CSM） | ESP 上的 `\EFI\BOOT\BOOTX64.EFI`（可移动介质回退路径） | p1 vfat 里的 `EFI/BOOT/` |
+| Legacy / CSM | MBR 引导码 + p128（EF02）里的 `core.img` | p1 vfat 里的 `boot/grub/i386-pc/` |
+
+**实测事故（值得记住的形态）**：早先的镜像只装了 legacy 引导器，在纯 UEFI 固件上表现为——显示器上
+一个 `UEFI Interactive Shell v2.2`（EDK II，AMI v2.70）提示符，**没有任何我们的日志**，网络里也看不到设备。
+根因不是镜像没写对（`HD(1,GPT)`/`HD(2,GPT)`/`HD(128,GPT)` 几何都对），而是 UEFI 固件只认 PE 引导器，
+枚举不到可引导项就落到内置 **UEFI Shell**（没有 shell 命令、只有 `Shell>` 提示符）。
+
+排查口径：进 BIOS 看 Boot 页有没有 `UEFI: <磁盘型号>` 条目；盘挂到另一台机器上 `ls <p1>/EFI/BOOT` 应为
+`BOOTX64.EFI`（PE 头 `MZ`）。CI 侧由 `phase1/tools/qemu-boot-check.sh` 在 UEFI 与 legacy 两种固件下各冷启动
+一次作为门禁——"装配对但起不来"从此会红，而不是全绿出厂。
 
 ### B.3 首启会发生什么
 

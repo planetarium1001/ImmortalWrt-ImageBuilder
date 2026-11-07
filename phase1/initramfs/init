@@ -611,6 +611,19 @@ drop_trial_marker
 # 也不能简单 umount：那样切根后再失败就没地方写日志、更删不了标记。
 relocate_boot
 
+# ---- 13b) 新根必须自带 /proc /sys /dev /tmp 这四个挂载点目录 ----
+# 为什么由 initramfs 补：镜像的 rootfs 是用 `tar --exclude=./proc ...` 打包的，而 GNU tar 的
+# exclude 会把**目录本体连同内容一起排掉** ⇒ @root 里根本没有这四个目录。procd 的
+# early_mounts() 用裸 mount(2) 挂 proc/sysfs/tmpfs/devtmpfs，既不 mkdir 也不检查返回值，
+# 目录不存在就全部 ENOENT 静默失败 ⇒ 用户态没有 /proc /sys /dev，netifd 读不到
+# /sys/class/net ⇒ 一个网口都不会被配置（2026-11-07 真机事故的第二个缺陷：通电、起来、
+# 但上游与本机后台两边都看不到设备）。必须在 switch_root **之前**建，建在 @overlay 写层上。
+for _d in proc sys dev tmp; do
+	/bin/busybox mkdir -p "$P1_NEWROOT/$_d" ||
+		die newroot-mounts "mkdir -p $P1_NEWROOT/$_d 失败（新根不可写？）"
+done
+logline "phase1-init: info 新根挂载点已就绪: proc sys dev tmp"
+
 /bin/busybox echo "initramfs: switching root upperdir=/overlay/upper"
 logline "initramfs: switching root upperdir=/overlay/upper"
 logline "phase1-init: info /proc/mounts（切根前的现场）："

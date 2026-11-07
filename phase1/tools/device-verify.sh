@@ -1,4 +1,10 @@
 #!/bin/sh
+# ⚠️ LEGACY（2026-11-07）：本脚本只服务**旧布局**（`p1 32M + p2 512M squashfs + p3 btrfs`，
+#    子卷 `@phase1-root`/`@phase1-overlay`，前提取 `rdinit=/init phase1_dev=/dev/nvme0n1p3`）。
+#    当前 CI 产物是 `p1 256M vfat + p128 EF02 4M + p2 btrfs 到盘尾`、子卷 `@root @overlay @docker @swap`，
+#    拿本脚本验新镜像会大面积 FAIL，而 FAIL 原因与"镜像真坏了"无法区分。
+#    → 新镜像请用 `phase1/tools/device-firstboot-verify.sh`；本脚本保留是为了让历史真机证据
+#      （第一轮/第二轮 `--collected` 判据表）仍可复核，**不要在此追加新判据**。
 # phase1/tools/device-verify.sh —— Phase 1 真机判据的机械化复核（ac-8 / ac-9 / ac-10 / ac-11 / ac-12 / ac-13 / ac-14）
 #
 # 两种模式

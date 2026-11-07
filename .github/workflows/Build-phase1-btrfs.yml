@@ -299,11 +299,14 @@ jobs:
           # phase1/assemble-image.sh 的 image_check_tools 要这些：缺一个就硬失败在构建中途。
           # grub-pc-bin 提供 i386-pc 模块树与 core.img（只有 grub-common 时 grub-install 必失败）。
           sudo apt-get update -qq
+          # grub-efi-amd64-bin：x86_64-efi 模块树（UEFI 引导器）。
+          # qemu-system-x86 + ovmf：冷启动冒烟（没有它就只能"静态全绿但机器起不来"，2026-11-07 事故）。
           sudo apt-get install -y \
-            gdisk dosfstools btrfs-progs grub-pc-bin grub-common util-linux coreutils e2fsprogs \
-            cpio squashfs-tools
+            gdisk dosfstools btrfs-progs grub-pc-bin grub-efi-amd64-bin grub-common \
+            util-linux coreutils e2fsprogs cpio squashfs-tools \
+            qemu-system-x86 ovmf
           for t in sgdisk mkfs.vfat mkfs.btrfs btrfs grub-install losetup partx truncate cpio \
-            grub-script-check mkfs.ext4; do
+            grub-script-check mkfs.ext4 qemu-system-x86_64; do
             command -v "$t" >/dev/null || {
               echo "::error::宿主机缺工具: $t"
               exit 1
@@ -428,6 +431,45 @@ jobs:
           gz=$(basename "$IMG_GZ")
           ( cd "$OUT" && sha256sum "$gz" | tee "$gz.sha256" )
 
+      - name: Boot smoke (UEFI + legacy)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 这一步是 2026-11-07 两次真机事故的产物：镜像可以"装配全对、静态自检全绿"却起不来。
+          # 只有在 qemu 里真的冷启动一次，才能证明 GRUB/内核/initramfs/switch_root 这条链是活的。
+          WORK="$RUNNER_TEMP/phase1-work"
+          OUT="$RUNNER_TEMP/phase1-out"
+          mode="${{ inputs.mode }}"
+          IMG_GZ="$OUT/immortalwrt-phase1-${mode}-x86-64.img.gz"
+          IMG="$WORK/phase1-smoke.img"
+
+          # 每档固件都用一份**干净**镜像：qemu 会写盘（首启扩容/日志），而 p1 的 phase1-boot.log 是追加的，
+          # 复用同一份会让第二次（bios）吃到第一次（uefi）留下的日志 ⇒ 门禁假绿。
+          gunzip -c "$IMG_GZ" > "$IMG.pristine"
+          rc_all=0
+          for fw in uefi bios; do
+            cp --reflink=auto "$IMG.pristine" "$IMG"
+            echo "=== boot smoke: $fw ==="
+            set +e
+            sudo env BOOT_TIMEOUT=300 sh phase1/tools/qemu-boot-check.sh --image "$IMG" --firmware "$fw" \
+              --log-out "$WORK" \
+              2>&1 | tee "$WORK/boot-smoke-${mode}-${fw}.txt"
+            rc=${PIPESTATUS[0]}
+            set -e
+            {
+              echo "### 冷启动冒烟（mode=${mode}, firmware=${fw}, rc=${rc}）"
+              echo '```'
+              tail -40 "$WORK/boot-smoke-${mode}-${fw}.txt"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            [ "$rc" = 0 ] || rc_all=$rc
+          done
+          rm -f "$IMG" "$IMG.pristine"
+          if [ "$rc_all" != 0 ]; then
+            echo "::error::冷启动冒烟失败（镜像在 qemu 里起不来，别拿去刷真机）"
+            exit 1
+          fi
+
       - name: Verify --image mode end-to-end
         shell: bash
         run: |
@@ -444,6 +486,11 @@ jobs:
           path: |
             ${{ runner.temp }}/phase1-out/*.img.gz
             ${{ runner.temp }}/phase1-out/*.img.gz.sha256
+            ${{ runner.temp }}/phase1-work/boot-smoke-*.txt
+            ${{ runner.temp }}/phase1-work/serial-*.log
+            ${{ runner.temp }}/phase1-work/qemu-*.out
+            ${{ runner.temp }}/phase1-work/phase1-boot-*.log
+            ${{ runner.temp }}/phase1-work/selfcheck.txt
           if-no-files-found: error
           retention-days: 14
 

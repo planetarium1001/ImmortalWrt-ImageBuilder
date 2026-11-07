@@ -977,6 +977,7 @@ print_plan() {
 	say "  拷贝  : $KERNEL -> $BOOT_MNT$KERNEL_PATH"
 	say "  拷贝  : $INITRD -> $BOOT_MNT$INITRD_PATH"
 	say "  grub-install --target=i386-pc --boot-directory=$BOOT_MNT${BOOT_SUBDIR:+/$BOOT_SUBDIR} $DISK"
+	say "  grub-install --target=x86_64-efi --efi-directory=$BOOT_MNT --boot-directory=$BOOT_MNT${BOOT_SUBDIR:+/$BOOT_SUBDIR} --removable --no-nvram ${DISK}（EFI 回退路径 EFI/BOOT/BOOTX64.EFI）"
 	say "  渲染  : phase1/grub/grub.cfg.in -> $BOOT_MNT$_grubdir/grub.cfg"
 	say "  试跑标记  : grub 视角 ${MARKER_PATH} 或 ${MARKER_PATH_ALT}（= 引导分区根上的 try-phase1）；最终镜像不创建"
 	say ""
@@ -1120,6 +1121,22 @@ extract_rootfs() { # <源 FILE|DIR> <目标目录>
 		tar -xpf "$_src" "$@" -C "$_dst" ||
 			fail "解包失败: $_src -> $_dst" "确认 $ROOTFS 是未损坏的 rootfs.tar.gz"
 	fi
+
+	# 补回挂载点目录本体（**根因修复**，不只是运行时兜底）。
+	# 为什么必须有这一步：上面那串 exclude 会把**目录项本身**一起排掉（GNU tar 语义，
+	# 2026-11-07 用同样的 argv 复现过），而上游 base-files 是显式 `mkdir -p` 这些骨架目录并
+	# `chmod 1777 /tmp` 的。目录缺席时 procd 的裸 mount(2) 全部 ENOENT 且不检查返回值 ⇒ 用户态没有
+	# /proc /sys /dev ⇒ netifd 读不到 /sys/class/net ⇒ 一个网口都不配置（真机事故②）。
+	# initramfs 里也补了一遍（defense-in-depth），但镜像本体必须是完整的：换任何别的引导路径
+	# （上游 initramfs、将来 A/B 换槽）都不该重新踩这个坑。
+	for _mp in proc sys dev tmp; do
+		mkdir -p "$_dst/$_mp" || fail "补建挂载点失败: $_dst/$_mp" "确认 @root 可写"
+	done
+	chmod 1777 "$_dst/tmp" || fail "chmod 1777 $_dst/tmp 失败" "tmp 必须是 1777（上游约定）"
+	for _mp in proc sys dev tmp; do
+		[ -d "$_dst/$_mp" ] || fail "挂载点目录缺失: $_dst/$_mp" "排除清单把目录本体排掉了？"
+	done
+	say "  挂载点  : 已补建 /proc /sys /dev /tmp（tmp 为 1777）"
 }
 
 sha256_of() { # <文件>
@@ -1205,6 +1222,38 @@ install_grub() { # <内核文件> <initrd 文件> [目标设备，默认 $DISK] 
 		--modules="$GRUB_MODULES" \
 		$_ghflags "$_target" ||
 		fail "grub-install 失败" "确认 p128 EF02 分区存在（sgdisk -p $_target 的第 128 号）"
+
+	# legacy 装完再装 UEFI：镜像要**双模**。理由（2026-11-07 真机事故）：
+	#   N5105 的固件是纯 UEFI（AMI v2.70，无 CSM）。UEFI 只认 ESP 上的
+	#   \EFI\BOOT\BOOTX64.EFI（可移动介质回退路径），而当时镜像只装了 i386-pc，
+	#   固件枚举不到可引导项，直接落到内置 "UEFI Interactive Shell v2.2"。
+	#   --removable 生成回退路径、--no-nvram 不写 NVRAM（整盘 dd 出来的盘本来也无法写）。
+	install_grub_efi "$_target"
+}
+
+# UEFI（x86_64-efi）引导器安装。必须在 p1 以 vfat 挂载、且分区类型为 EF00 时调用。
+install_grub_efi() { # <目标盘（仅日志用）>
+	_efi_target=$1
+	_efi_mods='part_gpt fat normal linux search search_fs_uuid search_label test echo serial terminal configfile'
+	if [ ! -d /usr/lib/grub/x86_64-efi ] && [ ! -d /usr/share/grub/x86_64-efi ]; then
+		fail "找不到 x86_64-efi 模块树" "装 grub-efi-amd64-bin（Debian/Ubuntu: apt install grub-efi-amd64-bin），否则打不出 UEFI 引导器"
+	fi
+	say "  \$ grub-install --target=x86_64-efi --efi-directory=$BOOT_MNT --boot-directory=$BOOT_MNT$(boot_prefix) --removable --no-nvram --modules=\"$_efi_mods\""
+	grub-install --target=x86_64-efi \
+		--efi-directory="$BOOT_MNT" \
+		--boot-directory="$BOOT_MNT$(boot_prefix)" \
+		--removable --no-nvram \
+		--modules="$_efi_mods" \
+		"$_efi_target" ||
+		fail "grub-install --target=x86_64-efi 失败" "确认 p1 已按 vfat 挂载、类型 EF00；确认装了 grub-efi-amd64-bin"
+	# 没落到 ESP 就不是"可 UEFI 引导"的镜像，必须当场失败（别把问题留到真机）
+	[ -f "$BOOT_MNT/EFI/BOOT/BOOTX64.EFI" ] ||
+		fail "EFI 引导器没落到 ESP" "期望 $BOOT_MNT/EFI/BOOT/BOOTX64.EFI（--removable 的产物）"
+	_efi_magic=$(dd if="$BOOT_MNT/EFI/BOOT/BOOTX64.EFI" bs=1 count=2 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+	if [ "$_efi_magic" != "4d5a" ]; then
+		fail "BOOTX64.EFI 不是 PE 可执行文件（magic=${_efi_magic}，应为 4d5a=MZ）" "确认装的是 x86_64-efi 而不是 arm64-efi"
+	fi
+	say "  EFI 引导器: $BOOT_MNT/EFI/BOOT/BOOTX64.EFI（$(wc -c <"$BOOT_MNT/EFI/BOOT/BOOTX64.EFI" | tr -d ' ') 字节）"
 }
 
 # --- 唯一的破坏性入口：所有写盘动作都在这个函数里 ---

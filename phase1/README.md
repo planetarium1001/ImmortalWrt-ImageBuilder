@@ -205,7 +205,7 @@ sh phase1/assemble-image.sh \
 2. 必须**手工输入 `yes`** 才继续（默认拒绝，其它任何输入都取消）；
 3. 破坏性动作全部集中在 `destructive_install()`：`sgdisk`（p1 → p128 → p2，`--set-alignment=2048` 固定几何）→
    `mkfs.vfat` / `mkfs.btrfs -L <--btrfs-label>` → `btrfs subvolume create` → 解包 `@root` →
-   写 `/.ab-base-manifest` → `grub-install --target=i386-pc` → 渲染 `grub.cfg`；
+   写 `/.ab-base-manifest` → `grub-install --target=i386-pc` + `--target=x86_64-efi --removable`（双模）→ 渲染 `grub.cfg`；
 4. 解包**必须**排除挂载点（`/proc /sys /dev /tmp /run /boot /rom /overlay /opt/docker /swap /data`）：
    `tar` 会把目录条目递归进去，实测误拷 22GB docker 镜像（decisions §O.2）；
 5. 解包是**两段式**（先 `tar -cf` 到临时 tar 并判 rc，再 `tar -xpf`）：POSIX sh 没有 `pipefail`，
@@ -228,7 +228,7 @@ sh phase1/assemble-image.sh --dry-run --image out.img --size 8G \
 
 - 步骤与真装机同源：`truncate` → `losetup --find --show --partscan` → `sgdisk`（p1/p128/p2）→
   `mkfs.vfat`/`mkfs.btrfs` → 子卷（`chattr +C`）→ 解包 `@root` + `/.ab-base-manifest` →
-  内核/initrd/`grub.cfg` → `grub-install --target=i386-pc` → 卸载 → `losetup -d`。
+  内核/initrd/`grub.cfg` → `grub-install --target=i386-pc` → `grub-install --target=x86_64-efi --removable`（写 `EFI/BOOT/BOOTX64.EFI`）→ 卸载 → `losetup -d`。
 - **`--image` 只产出未压缩 `.img`**；`gzip -9 -n` 与 `.sha256` 由 `phase1/build.sh` 负责。
 - 互斥：`--image` 不能与 `--disk` / `--grub-dir` / `--trial` 同时用；输出路径不许落在 `/dev/` 或是块设备；
   `--size` 下限 2G（`8G` 或 `8192M` 两种写法）。

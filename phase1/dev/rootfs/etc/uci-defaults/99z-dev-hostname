@@ -1,0 +1,48 @@
+#!/bin/sh
+# /etc/uci-defaults/99z-dev-hostname —— **dev 镜像**专用：把带外标识保住，并让上游 DHCP 能看到名字。
+#
+# 为什么需要它（2026-11-07 真机事故）：
+#   ① `files/etc/uci-defaults/99-custom.sh` 里有一句无条件的
+#        uci set system.@system[0].hostname='ImmortalWrt'
+#      而 uci-defaults 按文件名字典序执行：`90-dev-image`（加 -dev 后缀）**先**跑、
+#      `99-custom.sh` **后**跑 ⇒ 首启结束时 hostname 又变回 ImmortalWrt，`-dev` 丢掉。
+#   ② campus profile（`files/usr/sbin/netprofile`）把 `network.wan.hostname` 设成 `*`，
+#      netifd 的 dhcp 协议见到 `*` 就**不发** DHCP option 12 ⇒ 上游路由器的客户端列表里
+#      只有 MAC、没有名字。
+#   两条叠加的直接后果：docs/install.md 里"在上游 DHCP 列表找 hostname 带 -dev 的那台"
+#   这条唯一的带外发现手段在代码层面是断的。
+#
+# 因此本脚本必须在 `99-custom.sh` **之后**执行（所以叫 99z-），把两件事都改回来。
+# prod 镜像里不存在这个文件（它只放在 phase1/dev 注入树里）。
+set -u
+
+LOG=/etc/config/uci-defaults-log.txt
+log() { echo "$(date '+%F %T') 99z-dev-hostname: $*" >>"$LOG" 2>/dev/null; }
+
+_host=$(uci -q get system.@system[0].hostname 2>/dev/null) || _host=''
+[ -n "${_host}" ] || _host='ImmortalWrt'
+case "${_host}" in
+	*-dev) _name=${_host} ;;
+	*)     _name="${_host}-dev" ;;
+esac
+
+if uci set "system.@system[0].hostname=${_name}" && uci commit system; then
+	log "hostname=${_name}"
+else
+	log "写 system 失败，hostname 保持 ${_host}"
+	exit 1
+fi
+
+# WAN 的 DHCP 客户端要不要报名字：dev 必须报，否则上游认不出这台机器。
+if uci -q get network.wan >/dev/null 2>&1; then
+	if uci set "network.wan.hostname=${_name}" && uci commit network; then
+		log "network.wan.hostname=${_name}（覆盖 campus profile 的 '*'）"
+	else
+		log "写 network.wan.hostname 失败（下次开机重试）"
+		exit 1
+	fi
+else
+	log "没有 network.wan 段（首启网络还没生成？），跳过 wan.hostname"
+fi
+
+exit 0

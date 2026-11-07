@@ -18,10 +18,12 @@ cd "$REPO" || { bad "进不去仓库根目录"; echo "SHELL-PORTABILITY FAILED";
 
 echo "== \$VAR 后紧跟非 ASCII 字符时必须用 \${VAR}（macOS bash 3.2 会吞掉变量名）=="
 # 只看代码行：注释里的示例不算违规。
+# 排除 shell/tests/shell-fullwidth-var.sh：那条护栏的职责就是**造反例**（文件里必须有 $foo）这种字面量），
+# 让它自己被扫等于要求它删掉测试数据。
 bad_lines=$(perl -ne '
 	next if /^\s*#/;
 	print "$ARGV:$.: $_" if /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]/;
-' $(git ls-files 'files/usr/sbin/*' 'files/etc/init.d/*' 'files/etc/uci-defaults/*' 'files/lib/preinit/*' 'phase1/*.sh' 'phase1/tests/*.sh' 'phase1/tools/*.sh' 'phase1/dev/rootfs/etc/uci-defaults/*' 'phase1/firstboot/rootfs/etc/uci-defaults/*' 'shell/tests/*.sh' 'shell/*.sh' 'x86-64/*.sh' 2>/dev/null) 2>/dev/null)
+' $(git ls-files 'files/usr/sbin/*' 'files/etc/init.d/*' 'files/etc/uci-defaults/*' 'files/lib/preinit/*' 'phase1/*.sh' 'phase1/tests/*.sh' 'phase1/tools/*.sh' 'phase1/dev/rootfs/etc/uci-defaults/*' 'phase1/firstboot/rootfs/etc/uci-defaults/*' 'shell/tests/*.sh' 'shell/*.sh' 'x86-64/*.sh' ':(exclude)shell/tests/shell-fullwidth-var.sh' 2>/dev/null) 2>/dev/null)
 if [ -z "$bad_lines" ]; then
 	ok "没有 \$VAR 紧邻非 ASCII 的写法"
 else

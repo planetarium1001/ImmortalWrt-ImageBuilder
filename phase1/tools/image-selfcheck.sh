@@ -240,6 +240,23 @@ printf '\n=== 3. 内容 ===\n'
 if mount -o ro,subvol=@root "${LOOP}p2" "$MNT_ROOT" 2>/dev/null; then
 	if [ -f "$MNT_ROOT/etc/openwrt_release" ]; then
 		pass "@root/etc/openwrt_release 存在（$(awk -F= '/^PRETTY_NAME/ {print $2}' "$MNT_ROOT/etc/openwrt_release" 2>/dev/null)）"
+		# 挂载点目录本体（2026-11-07 真机事故②）：tar --exclude 会把目录项一起排掉，
+		# 而 procd 用裸 mount 挂 proc/sysfs/tmpfs/devtmpfs，目录缺席就全部静默失败 ⇒ 用户态没网。
+		_missing=''
+		for _mp in proc sys dev tmp; do
+			[ -d "$MNT_ROOT/$_mp" ] || _missing="$_missing $_mp"
+		done
+		if [ -z "$_missing" ]; then
+			pass "@root 有 /proc /sys /dev /tmp 四个挂载点目录"
+		else
+			fail "@root 缺挂载点目录:${_missing}（procd 挂不上 ⇒ netifd 枚举不到网口）"
+		fi
+		_tmpmode=$(stat -c '%a' "$MNT_ROOT/tmp" 2>/dev/null || echo '?')
+		if [ "$_tmpmode" = '1777' ]; then
+			pass "/tmp 权限 1777（上游约定）"
+		else
+			fail "/tmp 权限是 ${_tmpmode}（应为 1777）"
+		fi
 	else
 		fail "@root/etc/openwrt_release 缺失"
 	fi
@@ -389,6 +406,20 @@ if mount -o ro "${LOOP}p1" "$MNT_P1" 2>/dev/null; then
 	else
 		fail "p1 缺 boot/grub/i386-pc/core.img（p128 EF02 装不上）"
 	fi
+	# UEFI 引导器（2026-11-07 真机事故后新增）：纯 UEFI 固件只认 ESP 上的 PE 引导器。
+	# 只装 i386-pc 时 N5105 直接落到 "UEFI Interactive Shell v2.2"，而当时的自检对此毫无覆盖。
+	if [ -f "$MNT_P1/EFI/BOOT/BOOTX64.EFI" ]; then
+		pass "p1 有 EFI/BOOT/BOOTX64.EFI（$(wc -c <"$MNT_P1/EFI/BOOT/BOOTX64.EFI" | tr -d ' ') bytes）"
+		_magic=$(dd if="$MNT_P1/EFI/BOOT/BOOTX64.EFI" bs=1 count=2 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+		if [ "$_magic" = '4d5a' ]; then
+			pass "BOOTX64.EFI 是 PE 可执行文件（magic=4d5a=MZ）"
+		else
+			fail "BOOTX64.EFI 不是 PE 可执行文件（magic=${_magic}）"
+		fi
+	else
+		fail "p1 缺 EFI/BOOT/BOOTX64.EFI（纯 UEFI 固件将无法引导，会落到 UEFI Shell）"
+	fi
+
 	for _m in serial.mod terminal.mod; do
 		[ -f "$MNT_P1/boot/grub/i386-pc/$_m" ] && pass "p1 有 grub 模块 ${_m}" ||
 			fail "p1 缺 grub 模块 ${_m}"

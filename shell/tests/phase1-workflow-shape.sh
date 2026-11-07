@@ -310,7 +310,7 @@ block_has "摘要里带 sha256" "$BLOCK_SUM" "sha256"
 block_has "摘要里带包基线取证" "$BLOCK_SUM" "pkg-baseline.txt"
 block_has "摘要里带 CUSTOM_PACKAGES" "$BLOCK_SUM" "CUSTOM_PACKAGES"
 
-echo "== 11. 十一个步骤齐备且顺序正确 =="
+echo "== 11. 十二个步骤齐备且顺序正确 =="
 _prev=0
 _order=0
 for _n in \
@@ -321,6 +321,7 @@ for _n in \
 	"Install host tools" \
 	"Build phase1 image" \
 	"Self-check image" \
+	"Boot smoke (UEFI + legacy)" \
 	"Verify --image mode end-to-end" \
 	"Upload artifacts" \
 	"Upload build logs on failure" \
@@ -338,8 +339,21 @@ for _n in \
 	fi
 	_prev=$_ln
 done
-eq "十一个步骤顺序正确" 0 "$_order"
-eq "步骤总数" 11 "${_names:-0}"
+eq "十二个步骤顺序正确" 0 "$_order"
+# 不再断言"字面总数=12"：那是 change-detector（插一个无关步骤就得来改测试），
+# 而且它保护的"步骤齐备"已由上面的名单+顺序循环覆盖。改成"名单覆盖全部步骤"。
+_expected=$(printf '%s\n' 	"Checkout code" 	"Materialize fe53232 baseline content" 	"Build rootfs with ImageBuilder" 	"Extract rootfs and kernel" 	"Install host tools" 	"Build phase1 image" 	"Self-check image" 	"Boot smoke (UEFI + legacy)" 	"Verify --image mode end-to-end" 	"Upload artifacts" 	"Upload build logs on failure" 	"Write job summary" | grep -c .)
+eq "名单覆盖全部步骤（不多不少）" "${_expected}" "${_names:-0}"
+
+echo "== 11b. 冷启动冒烟步骤本身必须 fail-closed（新门禁的关键属性）=="
+BLOCK_BOOT=$(step_block "Boot smoke (UEFI + legacy)")
+block_has "调用 qemu-boot-check.sh" "$BLOCK_BOOT" "qemu-boot-check.sh"
+block_has "跑 UEFI 档" "$BLOCK_BOOT" "for fw in uefi bios"
+block_has "带超时 BOOT_TIMEOUT" "$BLOCK_BOOT" "BOOT_TIMEOUT"
+block_has "失败要 exit 1（不许吞）" "$BLOCK_BOOT" "exit 1"
+block_has "报告落盘为 boot-smoke-*.txt" "$BLOCK_BOOT" "boot-smoke-"
+block_has "两种固件各用一份干净镜像（避免旧日志冒充）" "$BLOCK_BOOT" "cp --reflink=auto"
+block_has "失败要保留现场（--log-out 归档串口/qemu 日志）" "$BLOCK_BOOT" "--log-out"
 
 echo "== 12. trap 清理：不留脏挂载 / 脏 loop =="
 has "rootfs/内核提取步骤装了 EXIT trap" "trap cleanup EXIT"

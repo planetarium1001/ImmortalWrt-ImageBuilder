@@ -7,9 +7,11 @@
 # 这样验收不依赖"人眼看一下 CI 绿了"。
 #
 # 用法：
-#   sh phase1/tools/verify-ci-report.sh <report.txt> --mode dev|prod [--stage layout|content|devprod|all]
+#   sh phase1/tools/verify-ci-report.sh <report.txt> --mode dev|prod [--stage layout|content|devprod|boot]
 #
 # 默认 --stage all（= layout + content + devprod + "SELFCHECK OK 且无 FAIL"）。
+# 引导冒烟是**另一份报告**（boot-smoke-<mode>-<fw>.txt，由 phase1/tools/qemu-boot-check.sh 产出），
+# 所以 `--stage boot` 要单独跑一次，不并进 all（all 的输入是 selfcheck 报告，里面没有冒烟行）。
 # 报告来源：CI 的 `Self-check image` 步骤日志，去掉时间戳前缀后形如
 #   PASS  p1 = 256 MiB（524288 扇区）
 #   ...
@@ -62,8 +64,8 @@ dev | prod) ;;
 *) die "--mode 只接受 dev|prod" ;;
 esac
 case $STAGE in
-layout | content | devprod | all) ;;
-*) die "--stage 只接受 layout|content|devprod|all" ;;
+layout | content | devprod | boot | all) ;;
+*) die "--stage 只接受 layout|content|devprod|boot|all" ;;
 esac
 
 pass() { printf '  ok   %s\n' "$*"; }
@@ -152,6 +154,33 @@ if [ "$STAGE" = devprod ] || [ "$STAGE" = all ]; then
 		need "prod: /etc 下无 dev-open-wan" "PASS  prod: /etc 下没有 dev-open-wan"
 		not_need "prod: 报告里没有 dev-open-wan 的 PASS（自相矛盾）" "PASS  dev: 90-dev-image 含 dev-open-wan"
 	fi
+fi
+
+if [ "$STAGE" = boot ]; then
+	printf '\n== 引导冒烟（ac-2 / ac-4）==\n'
+	# 冒烟报告来自 CI 里 phase1/tools/qemu-boot-check.sh 的输出（UEFI 与 legacy 各一次）。
+	# 进门禁的理由：2026-11-07 的事故是"静态自检全绿、机器根本起不来"。
+	if grep -q 'BOOT-SMOKE OK' "$REPORT"; then
+		pass "报告结论是 BOOT-SMOKE OK"
+	else
+		bad "报告里没有 BOOT-SMOKE OK（镜像没在 qemu 里起来，或该次 CI 没跑冒烟）"
+	fi
+	# 判据用**稳定 id**（bs-1/bs-2/bs-3）而不是整句中文文案，避免冒烟脚本改一句措辞就静默失配。
+	for _id in bs-1 bs-2 bs-3; do
+		if grep -q "ok   ${_id} " "$REPORT"; then
+			pass "${_id} 通过"
+		else
+			bad "${_id} 未通过（报告里没有 'ok   ${_id}'）"
+		fi
+	done
+	# bs-1 必须来自 p1 引导日志（串口里永远没有那行），报告里应能看到证据源
+	if grep -q 'p1 日志本次启动段有 switching root' "$REPORT"; then
+		pass "bs-1 的证据源是 p1 引导日志（不是串口）"
+	else
+		bad "bs-1 的证据源看起来不对（应在 p1 引导日志本次启动段里找 switching root）"
+	fi
+	not_need "报告里没有 FAIL 行" "  FAIL "
+	not_need "报告里没有 BOOT-SMOKE FAILED" "BOOT-SMOKE FAILED"
 fi
 
 if [ "$STAGE" = all ]; then
